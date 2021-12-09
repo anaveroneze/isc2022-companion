@@ -1,0 +1,31 @@
+# -- org-startup-with-inline-images: nil --
+#+TITLE: Companion Material - ISC22
+#+AUTHOR: Solorzano, Schnorr
+#+LATEX_HEADER: \usepackage[margin=2cm,a4paper]{geometry}
+#+STARTUP: overview indent noinlineimages
+#+TAGS: noexport(n) deprecated(d)
+#+EXPORT_SELECT_TAGS: export
+#+EXPORT_EXCLUDE_TAGS: noexport
+#+SEQ_TODO: TODO(t!) STARTED(s!) WAITING(w!) | DONE(d!) CANCELLED(c!) DEFERRED(f!)
+
+* Introduction
+
+Companion Material for the paper ``Understanding Distributed Deep
+Learning Performance by Correlating HPC and Machine Learning
+Measurements''. Submitted for the ISC High Performance 2022.
+
+You can clone this repository with the following command:
+#+begin_src shell :session *shell* :results output :exports both 
+git clone https://gitlab.com/anaveroneze/isc22-companion.git
+#+end_src
+
+- The [[./img]] directory contains the expected Figures for our code
+  snippets
+- The output.zip file contains a directory with the dataset obtained
+  with experiments for Horovod and Tarantella
+- The [[./scripts]] directory contains the code snippets used to our
+  performance analysis and generate the figures
+
+* Authors
+- Ana Luisa Veroneze Solórzano - Informatics Institute/UFRGS, Brazil
+- Lucas Mello Schnorr - Informatics Institute/UFRGS, Brazil
