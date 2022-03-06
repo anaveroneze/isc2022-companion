@@ -12,7 +12,8 @@
 
 Companion Material for the paper ``Understanding Distributed Deep
 Learning Performance by Correlating HPC and Machine Learning
-Measurements''. Submitted for the ISC High Performance 2022.
+Measurements'', by Ana Luisa Veroneze Solórzano and Lucas Mello 
+Schnorr. Approved for the ISC High Performance 2022.
 
 You can clone this repository with the following command:
 #+begin_src shell :session *shell* :results output :exports both 
