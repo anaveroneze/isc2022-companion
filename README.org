@@ -22,24 +22,26 @@ git clone https://gitlab.com/anaveroneze/isc22-companion.git
 
 - The [[./img]] directory contains the expected Figures for our code
   snippets
-- The output.zip file contains a directory with the dataset obtained
-  with experiments for Horovod and Tarantella
+- The [[./output/final.tar.gz]] file contains all dataset obtained with
+  experiments for Horovod and Tarantella used to this analysis
 - The [[./scripts]] directory contains the code snippets used to our
   performance analysis and generate the figures
 
 * Requirements
 
 The code and data manipulation were written in the R programming
-language using the tidyverse, a collection of R packages for data
-science. 
+language using the [[https://cran.rstudio.com/web/packages/tidyverse/][tidyverse]], a collection of R packages for data
+science.
 
-We also use the cowplot package useful to combine multiple ggplots
-into the same graphic, the DBI package to manipulate SQlite files
+We use the [[https://cran.rstudio.com/web/packages/cowplot/][cowplot]] package to combine multiple ggplots into the same
+graphic, the [[https://dbi.r-dbi.org/][DBI]] package to manipulate SQLite files, [[https://cran.rstudio.com/web/packages/ggforce/][ggforce]] for
+zooming into one facet region, [[https://cran.r-project.org/web/packages/lubridate/][lubridate]] to deal with dates
+conversion, and [[https://cran.rstudio.com/web/packages/ggh4x][ggh4x]] to resize some panels with facets.
 
-Run the snippet down below:
+Run the snippet down below to download all:
 
 #+begin_src shell :results output :exports both
-install.packages(c("tidyverse", "DBI", "ggforce", "cowplot", "lubridate", "ggh4x"))
+install.packages(c("tidyverse", "cowplot", "DBI", "ggforce", "lubridate", "ggh4x"))
 #+end_src
 
 * Authors
