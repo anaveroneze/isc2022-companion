@@ -6,15 +6,13 @@ Code and analysis for the paper approved for the ISC 2021.
 #+begin_src R :results output :session *R* :exports both
 options(crayon.enabled=FALSE)
 library(dplyr)
-library(data.table)
 library(DBI)
 library(tidyverse)  
 library(lubridate)
-library(patchwork)
-library(ggh4x)
 library(ggforce)
 library(cowplot)
 library(dplyr, warn.conflicts = FALSE)
+library(ggh4x)
 
 add_metadata <- function(df) {
     df %>%separate(Origin, into=c(paste0("P", 1:4)), sep="/", remove=FALSE) %>%
@@ -61,24 +59,26 @@ my_theme <- function() {
             strip.text.y = element_text(size = 18),                                                                                              
             legend.box.spacing = unit(0, "pt"))                                                                                                  
 }
-
-my_theme_exectime <- function() {                                                                                                                       
-    theme_bw(base_size=18) +                                                                                                                   
-        theme(panel.background = element_blank(),                                                                                                  
-              legend.box.margin = margin(0,0,0,0),                                                                                                 
-              legend.spacing = unit(0, "pt"),                                                                                                      
-              legend.position = "top",                                                                                                             
-              legend.text = element_text(color = "black", size = 16),                                                                                                      
-              strip.text.x = element_text(size = 16),                                                                                              
-              strip.text.y = element_text(size = 16),                                                                                              
-              legend.box.spacing = unit(0, "pt"),
-              legend.title = element_blank(), 
-              strip.placement= "outside",
-              panel.grid.major.y = element_blank())
-}
 #+end_src
 
 #+RESULTS:
+#+begin_example
+
+Attaching package: ‘lubridate’
+
+The following objects are masked from ‘package:data.table’:
+
+    hour, isoweek, mday, minute, month, quarter, second, wday, week,
+    yday, year
+
+The following object is masked from ‘package:cowplot’:
+
+    stamp
+
+The following objects are masked from ‘package:base’:
+
+    date, intersect, setdiff, union
+#+end_example
  
 * Performance Comparison Tarantella x Horovod
 ** Pre-process log data
@@ -133,7 +133,7 @@ read_csv(FILENAME,
 #+RESULTS:
 #+begin_example
 
-indexing full-lenet.csv [==================================] 26.50GB/s, eta:  0s                                                                                # A tibble: 3,543 × 16
+indexing full-lenet.csv [==================================] 23.11GB/s, eta:  0s                                                                                # A tibble: 3,543 × 16
    script.duration framework machine   gpus duration test.loss test.accuracy
              <dbl> <chr>     <chr>    <int>    <dbl>     <dbl>         <dbl>
  1            76.6 horovod   chifflet    10     75.3    0.107          0.975
@@ -165,7 +165,13 @@ df.total %>%
     ggplot(aes(x=as.factor(gpus), y=time, fill=Framework)) +
     geom_bar(stat="identity", width=.8, position = "dodge") +
     geom_errorbar(aes(ymin = (time-error_time), ymax = (time+error_time), width=0.5), position=position_dodge(width=0.8), color="black")+
-    my_theme_exectime() + 
+    theme_bw(base_size=18) + my_theme() +                                                                                                             
+    theme(legend.text = element_text(color = "black", size = 16),                                                                                                      
+          strip.text.x = element_text(size = 16),                                                                                              
+          strip.text.y = element_text(size = 16),     
+          legend.title = element_blank(), 
+          strip.placement= "outside",
+          panel.grid.major.y = element_blank()) +
     scale_fill_brewer(palette = "Set1") +
     scale_x_discrete("GPUs", breaks=c("1", "2", "4", "6", "8", "10", "12")) +
     facet_grid(batch~t, scales = "free_x") + 
@@ -269,7 +275,6 @@ dttm (1): time.temp
 ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
 #+end_example
 
-** Read all the execution times in the previous input
 ** Get time in the first epoch
 #+begin_src R :results output :session *R* :exports both
 df.100 %>%
@@ -434,7 +439,6 @@ left_join(df.diff, df.total.makespan,
 : 
 : `summarise()` has grouped output by 'framework', 'gpus'. You can override using the `.groups` argument.
 
-
 #+begin_src R :results output :session *R* :exports both
 left_join(df.diff, per, 
           by = c("framework", "gpus", "machine")) %>%
@@ -487,7 +491,7 @@ df.init.time %>%
 [[file:./../img/initialization-time-100batch-1rep-per.pdf]]
 
 * Efficiency scaling
-*** Process data
+** Process data
 Get time with one GPU
 #+begin_src R :results output :session *R* :exports both
 df.total %>%
@@ -801,7 +805,7 @@ df.efficiency %>% arrange(-efficiency) %>% as.data.frame()
 216 tarantella   gemini   720     12   17.66278  67.43144    142.9232
 #+end_example
 
-*** [Plot]
+** [Plot]
 #+begin_src R :results file graphics :file ./../img/efficiency.pdf :exports both :width 12 :height 6.5 :session *R* 
 df.efficiency %>%
     rename_machines() %>%
@@ -1153,6 +1157,7 @@ begin %>% as.data.frame()
 : 1 23.43521
 : 2 23.59287
 : 3 23.74885
+
 ** [Plot] One epoch tracing with Score-P
 
 #+begin_src R :results output file graphics :file ./../img/scorep-1500.pdf :exports both :width 12 :height 4.7 :session *R*
@@ -1262,7 +1267,7 @@ df.callbacks %>% distinct(operation)
 #+begin_example
 
 Rows: 1928 Columns: 9
-── Column specification ────────────────────────────────────────────────────────────────────────────────
+── Column specification ─────────────────────────────────────────────────────────────────────────────────
 Delimiter: ","
 chr  (7): machine, framework, event.type, operation, type, parameter, garbage
 dbl  (1): rank
@@ -1549,6 +1554,8 @@ if(length(csv_files) != 0) {
 10           1.e18         1.e18        0 11205     horovod  
 # … with 103,154 more rows, and 2 more variables: start.date <dttm>,
 #   end.date <dttm>
+Warning message:
+call dbDisconnect() when finished working with a connection
 #+end_example
 ** Pre-process for both
 Get zeros for each process using the nvprof nvvp file
@@ -2203,27 +2210,6 @@ Data about the first epoch:
 #+begin_src R :results output :session *R* :exports both
 df.all %>% filter(epoch==0) %>% arrange(-Time)
 #+end_src
-
-#+RESULTS:
-#+begin_example
-# A tibble: 12 × 6
-   epoch  rank Framework       T optype         Time
-   <int> <int> <chr>       <dbl> <chr>         <dbl>
- 1     0     0 Horovod    6.15   CPU            6.15
- 2     0     1 Horovod    5.80   CPU            5.8 
- 3     0     0 Tarantella 2.79   CPU            2.79
- 4     0     1 Tarantella 2.79   CPU            2.79
- 5     0     1 Horovod    0.957  GPU            0.96
- 6     0     0 Horovod    0.913  GPU            0.91
- 7     0     1 Tarantella 0.524  GPU            0.52
- 8     0     0 Tarantella 0.486  GPU            0.49
- 9     0     0 Tarantella 0.0570 Communication  0.06
-10     0     1 Tarantella 0.0586 Communication  0.06
-11     0     0 Horovod    0.0195 Communication  0.02
-12     0     1 Horovod    0.0190 Communication  0.02
-#+end_example
-
---
 
 #+RESULTS:
 #+begin_example

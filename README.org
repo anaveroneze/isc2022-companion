@@ -27,6 +27,21 @@ git clone https://gitlab.com/anaveroneze/isc22-companion.git
 - The [[./scripts]] directory contains the code snippets used to our
   performance analysis and generate the figures
 
+* Requirements
+
+The code and data manipulation were written in the R programming
+language using the tidyverse, a collection of R packages for data
+science. 
+
+We also use the cowplot package useful to combine multiple ggplots
+into the same graphic, the DBI package to manipulate SQlite files
+
+Run the snippet down below:
+
+#+begin_src shell :results output :exports both
+install.packages(c("tidyverse", "DBI", "ggforce", "cowplot", "lubridate", "ggh4x"))
+#+end_src
+
 * Authors
 - Ana Luisa Veroneze Solórzano - Informatics Institute/UFRGS, Brazil
 - Lucas Mello Schnorr - Informatics Institute/UFRGS, Brazil
