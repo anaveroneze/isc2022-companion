@@ -1,0 +1,2271 @@
+#+STARTUP: overview indent
+
+Code and analysis for the paper approved for the ISC 2021.
+
+* Load R libraries
+#+begin_src R :results output :session *R* :exports both
+options(crayon.enabled=FALSE)
+library(dplyr)
+library(data.table)
+library(DBI)
+library(tidyverse)  
+library(lubridate)
+library(patchwork)
+library(ggh4x)
+library(ggforce)
+library(cowplot)
+library(dplyr, warn.conflicts = FALSE)
+
+add_metadata <- function(df) {
+    df %>%separate(Origin, into=c(paste0("P", 1:4)), sep="/", remove=FALSE) %>%
+    separate(P3, into=c(paste0("Q", 1:4)), sep="-", remove=FALSE) %>%
+    select(-P1, -P2,-P3,-Q4) %>%
+    separate(P4, into=c(paste0("R", 1:3)), sep="-", remove=FALSE) %>%
+    select(-P4) %>%
+    mutate(R3 = gsub(".log", "", R3)) %>%
+    rename(Cluster = Q1,
+           Framework = Q2,
+           Network = Q3,
+           Batch.Size = R1,
+           Epoch.Amount = R2,
+           Repetition = R3) 
+}
+
+rename_machines <- function(df) {
+    df %>%
+    mutate(type = case_when(machine == "chifflet" ~ " - GTX1080",
+                            machine == "chifflot" ~ " - P100",
+                            machine == "gemini" ~ " - V100",
+                            TRUE ~ as.character(machine))) %>%
+        mutate(Framework = case_when(framework == "horovod" ~ "Horovod",
+                           framework == "tarantella" ~ "Tarantella",
+                           framework == "nologhvd" ~ "Horovod - No log",
+                           framework == "nologtnt" ~ "Tarantella - No log",
+                           framework == "tf" ~ "TensorFlow",
+                           TRUE ~ as.character(framework))) %>%
+        mutate(m = case_when(machine == "chifflet" ~ "Chifflet",
+                            machine == "chifflot" ~ "Chifflot",
+                            machine == "gemini" ~ "Gemini",
+                            TRUE ~ as.character(machine))) 
+}
+
+my_theme <- function() {                                                                                                                       
+      theme_bw(base_size=20) +                                                                                                                   
+      theme(panel.background = element_blank(),                                                                                                  
+            legend.box.margin = margin(0,0,0,0),                                                                                                 
+            legend.spacing = unit(0, "pt"),                                                                                                      
+            legend.position = "top",       
+            plot.title=element_text(vjust=-1.5, size = 20),                                                                                                      
+            legend.text = element_text(color = "black", size = 18),                                                                                                          
+            strip.text.x = element_text(size = 18),                                                                                              
+            strip.text.y = element_text(size = 18),                                                                                              
+            legend.box.spacing = unit(0, "pt"))                                                                                                  
+}
+
+my_theme_exectime <- function() {                                                                                                                       
+    theme_bw(base_size=18) +                                                                                                                   
+        theme(panel.background = element_blank(),                                                                                                  
+              legend.box.margin = margin(0,0,0,0),                                                                                                 
+              legend.spacing = unit(0, "pt"),                                                                                                      
+              legend.position = "top",                                                                                                             
+              legend.text = element_text(color = "black", size = 16),                                                                                                      
+              strip.text.x = element_text(size = 16),                                                                                              
+              strip.text.y = element_text(size = 16),                                                                                              
+              legend.box.spacing = unit(0, "pt"),
+              legend.title = element_blank(), 
+              strip.placement= "outside",
+              panel.grid.major.y = element_blank())
+}
+#+end_src
+
+#+RESULTS:
+ 
+* Performance Comparison Tarantella x Horovod
+** Pre-process log data
+#+begin_src shell :results output :exports both
+PATHFILE="./../output/final"
+FILENAME=full-lenet.csv
+
+if [[ -f $PATHFILE/$FILENAME ]]; then
+    rm $PATHFILE/$FILENAME
+    rm $PATHFILE/*csv
+fi
+
+for dir in ${PATHFILE}/*; do
+    tempvalues=`echo $dir | sed 's/.*\///'`
+    machine=`echo $tempvalues | cut -d "-" -f1`
+    framework=`echo $tempvalues | cut -d "-" -f2`
+
+    # Getting training information for each log file
+    for filename in $dir/*.log; do
+	time=`cat $filename | grep -oP "time:.*" | cut -d' ' -f2-`
+	loss=`cat $filename | grep -oP "loss.*" | cut -d' ' -f2- `
+	accuracy=`cat $filename | grep -oP "accuracy.*" | cut -d' ' -f2- `
+	batch=`echo $filename | sed 's/.*\///; s/-.*//'`
+	gpus=`echo $filename | sed -e 's/.*-\(.*\)-.*/\1/'`
+	rep=`echo $filename | sed 's/.*-//; s/.log.*//'`
+	startscript=`cat $filename | grep -oP "Start script:.*" | cut -d' ' -f3-`
+	endscript=`cat $filename | grep -oP "End script:.*" | cut -d' ' -f3-`
+	trainloss=`cat $filename | grep -oP "\[.*" | cut -d',' -f100 | sed 's/.$//' | head -n 1`
+	trainaccuracy=`cat $filename | grep -oP "\[.*" | cut -d',' -f100 | sed 's/.$//' | tail -n 1`
+	echo "$framework,$machine,$gpus,$time,$loss,$accuracy,$trainloss,$trainaccuracy,$batch,100,$rep,$startscript,$endscript" >> $PATHFILE/$FILENAME
+    done
+done
+#+end_src
+
+#+RESULTS:
+
+** Read csv
+#+begin_src R :results output :session *R* :exports both
+FILENAME="./../output/final/full-lenet.csv"
+read_csv(FILENAME,
+         col_names=c("framework", "machine", "gpus", "duration", "test.loss", "test.accuracy",
+                     "train.loss", "train.accuracy", "batch", "epochs","rep", "start", "end"), 
+         col_types = cols()) %>%
+    mutate(start.script = as.numeric(as.POSIXct(start, origin="1970-01-01", tz="03"))) %>%
+    mutate(end.script = as.numeric(as.POSIXct(end, origin="1970-01-01", tz="03"))) %>%
+    mutate(script.duration=end.script-start.script) %>% 
+    #select(-start,-end) %>%
+    mutate_at(c("rep", "batch", "gpus"), as.integer) %>% select(script.duration, everything()) %>% 
+    print -> df.total
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+indexing full-lenet.csv [==================================] 26.50GB/s, eta:  0s                                                                                # A tibble: 3,543 × 16
+   script.duration framework machine   gpus duration test.loss test.accuracy
+             <dbl> <chr>     <chr>    <int>    <dbl>     <dbl>         <dbl>
+ 1            76.6 horovod   chifflet    10     75.3    0.107          0.975
+ 2            76.4 horovod   chifflet    10     75.1    0.105          0.976
+ 3            76.2 horovod   chifflet    10     74.9    0.104          0.976
+ 4            75.7 horovod   chifflet    10     74.5    0.105          0.976
+ 5            76.6 horovod   chifflet    10     75.4    0.104          0.976
+ 6            76.2 horovod   chifflet    10     74.9    0.106          0.976
+ 7            76.8 horovod   chifflet    10     75.5    0.0957         0.977
+ 8            76.8 horovod   chifflet    10     75.5    0.104          0.976
+ 9            76.1 horovod   chifflet    10     74.8    0.107          0.976
+10            76.3 horovod   chifflet    10     75.0    0.105          0.976
+# … with 3,533 more rows, and 9 more variables: train.loss <dbl>,
+#   train.accuracy <dbl>, batch <int>, epochs <dbl>, rep <int>, start <dttm>,
+#   end <dttm>, start.script <dbl>, end.script <dbl>
+#+end_example
+
+** [Plot] Execution time 
+#+begin_src R :results output file graphics :file ./../img/execution-time.pdf :exports both :width 9 :height 9 :session *R* 
+df.total %>%
+    filter(framework != "tf") %>%
+    filter(framework != "nologhvd") %>%
+    filter(framework != "nologtnt") %>%
+    group_by(framework, machine, gpus, batch) %>%
+    summarize(n=n(), time=mean(duration), sd_time=sd(duration), .groups="drop")  %>%
+    mutate(error_time=3*sd_time/sqrt(n)) %>%
+    rename_machines() %>%
+    mutate(t = paste(m,type)) %>%
+    ggplot(aes(x=as.factor(gpus), y=time, fill=Framework)) +
+    geom_bar(stat="identity", width=.8, position = "dodge") +
+    geom_errorbar(aes(ymin = (time-error_time), ymax = (time+error_time), width=0.5), position=position_dodge(width=0.8), color="black")+
+    my_theme_exectime() + 
+    scale_fill_brewer(palette = "Set1") +
+    scale_x_discrete("GPUs", breaks=c("1", "2", "4", "6", "8", "10", "12")) +
+    facet_grid(batch~t, scales = "free_x") + 
+    scale_y_continuous("Execution time [s]", lim=c(0,650), expand=c(0,0), breaks=seq(0,600,200))
+#+end_src
+
+#+RESULTS:
+[[file:./../img/execution-time.pdf]]
+
+** [Plot] Overhead in a single GPU training
+#+begin_src R :results output :session *R* :exports both
+df.total %>%
+    filter(framework != "nologhvd" & framework != "nologtnt") %>%
+    filter(gpus == 1) %>%
+    group_by(framework, machine, gpus, batch) %>%
+    summarize(n = n(), time = mean(duration), sd_time=sd(duration), .groups="drop") %>%
+    mutate(error_time=3*sd_time/sqrt(n)) %>%
+    rename_machines() %>% 
+    mutate(l=paste(Framework, type)) %>%
+    group_by(machine, gpus, batch) %>%
+    mutate(distanceFromTF = time - min(time)) %>%
+    select(framework, distanceFromTF, everything()) %>% 
+    arrange (distanceFromTF) -> df.distances
+#+end_src
+
+#+RESULTS:
+
+#+begin_src R :results file graphics :file ./../img/execution-time-1gpu.pdf :exports both :width 12 :height 4.5 :session *R* 
+df.distances %>%
+    filter(framework != "tf") %>%
+    ggplot(aes(x=factor(batch), y=distanceFromTF, fill=Framework)) + 
+    geom_bar(stat="identity", position = position_dodge2(7)) + 
+    geom_errorbar(aes(ymin = (distanceFromTF-error_time), ymax = (distanceFromTF+error_time)),
+                  position = "dodge2", width=0.5) +
+    geom_text(size=5.5, aes(label=round(distanceFromTF, digits = 0), y = (distanceFromTF + error_time - 0.8)), 
+              position=position_dodge(width=0), vjust=-0.5, angle=0) +
+    facet_nested_wrap(~Framework+m, ncol=6) +
+    my_theme() + 
+    theme(legend.position = "none", 
+          axis.text.x = element_text(angle = 45, vjust = 1, hjust=0.9),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+    guides(fill=guide_legend(title="Batch size", nrow=1)) + #guide = guide_axis(check.overlap = TRUE), 
+    scale_x_discrete("Batch Size [number]", expand=c(0.15,0), breaks=c(100,180,360,720,1500,2250)) +
+    scale_y_continuous("Overhead Time [s]", lim=c(0,210), breaks=seq(0,400,50),expand=c(0,0)) +
+    scale_fill_brewer(palette = "Set1") 
+#+end_src
+
+#+RESULTS:
+[[file:./../img/execution-time-1gpu.pdf]]
+
+* Initialization time for 100 batch size - worst case
+** Pre-process data
+#+begin_src shell :results output :exports both
+PATHFILE="./../output/final"
+batch=100
+FILENAME=./../output/final/callbacks-init100.csv
+if [[ -f $FILENAME ]]; then
+    rm $FILENAME
+fi
+
+declare -a FrameworksNames=("${PATHFILE}/*-tarantella" "${PATHFILE}/*-horovod")
+
+echo "machine,framework,gpus,rep,event.type,rank,time.temp,operation,type,parameter,garbage" >> $FILENAME
+
+for dir in ${FrameworksNames[@]}; do
+    tempvalues=`echo $dir | sed 's/.*\///'`
+    machine=`echo $tempvalues | cut -d "-" -f1`
+    framework=`echo $tempvalues | cut -d "-" -f2`
+	
+	{
+	for file in $dir/$batch-*/logfile*; do
+	    gpus=`echo $file | cut -d "-" -f3`
+	    rep=`echo $file | cut -d "-" -f4 | sed 's/\/.*//'`
+	    cat $file | grep on_epoch | sed "s/^/${machine},${framework},${gpus},${rep},/"
+	done
+	} >> $FILENAME
+done
+#+end_src
+
+#+RESULTS:
+
+** Read
+#+begin_src R :results output :session *R* :exports both
+read_csv("./../output/final/callbacks-init100.csv", progress=FALSE) %>%
+    mutate(parameter = as.integer(gsub("\\(", "", parameter))) %>%
+    select(-garbage, -type)  -> df.100
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+Rows: 516000 Columns: 11
+── Column specification ────────────────────────────────────────────────────────
+Delimiter: ","
+chr  (7): machine, framework, event.type, operation, type, parameter, garbage
+dbl  (3): gpus, rep, rank
+dttm (1): time.temp
+
+ℹ Use `spec()` to retrieve the full column specification for this data.
+ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+#+end_example
+
+** Read all the execution times in the previous input
+** Get time in the first epoch
+#+begin_src R :results output :session *R* :exports both
+df.100 %>%
+    select(-operation) %>% 
+    group_by(machine, rank, framework, gpus, rep) %>%
+    arrange(time.temp) %>%
+    mutate(order = rep(seq(1,n()/2), each=2)) %>%
+    ungroup %>%
+    mutate(unique = rank * n() + order) %>%
+    pivot_wider(values_from="time.temp", names_from="event.type") %>%
+    select(framework, machine, gpus, rank, start, end, 
+           parameter, rep) %>% print -> df.epoch
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 258,000 × 8
+   framework machine   gpus  rank start               end                
+   <chr>     <chr>    <dbl> <dbl> <dttm>              <dttm>             
+ 1 horovod   chifflet     1     0 2021-09-13 20:21:57 2021-09-13 20:22:03
+ 2 horovod   chifflet     1     0 2021-09-13 20:22:03 2021-09-13 20:22:06
+ 3 horovod   chifflet     1     0 2021-09-13 20:22:06 2021-09-13 20:22:08
+ 4 horovod   chifflet     1     0 2021-09-13 20:22:08 2021-09-13 20:22:10
+ 5 horovod   chifflet     1     0 2021-09-13 20:22:11 2021-09-13 20:22:13
+ 6 horovod   chifflet     1     0 2021-09-13 20:22:13 2021-09-13 20:22:15
+ 7 horovod   chifflet     1     0 2021-09-13 20:22:15 2021-09-13 20:22:18
+ 8 horovod   chifflet     1     0 2021-09-13 20:22:18 2021-09-13 20:22:20
+ 9 horovod   chifflet     1     0 2021-09-13 20:22:20 2021-09-13 20:22:22
+10 horovod   chifflet     1     0 2021-09-13 20:22:22 2021-09-13 20:22:25
+# … with 257,990 more rows, and 2 more variables: parameter <int>, rep <dbl>
+#+end_example
+
+Get mean of the first epoch start and script init time
+#+begin_src R :results output :session *R* :exports both
+df.epoch %>%
+    filter(parameter == 0) %>% # Getting first epoch only
+    mutate(start.epoch = force_tz(as.POSIXct(start, origin="1970-01-01", tz="CET")) - 7200 , tzone = "", roll = FALSE) %>%
+    group_by(framework, machine, gpus, rank) %>%
+    summarize(mean.start.epoch = mean(start.epoch), .groups="drop") %>%
+    group_by(framework, machine, gpus) %>%
+    summarize(min.start.epoch = min(mean.start.epoch), .groups="drop") -> data1
+data1
+
+df.total %>% 
+    filter(framework == "horovod" | framework == "tarantella") %>%
+    filter(batch==100) %>% 
+    mutate(start.script = force_tz(as.POSIXct(start, origin="1970-01-01", tz="CET")), tzone = "", roll = FALSE) %>%
+    group_by(framework, machine, gpus) %>%
+    summarize(mean.start = mean(start.script), .groups="drop") %>% 
+    select(mean.start, everything()) -> data2
+data2
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 42 × 4
+   framework machine   gpus min.start.epoch    
+   <chr>     <chr>    <dbl> <dttm>             
+ 1 horovod   chifflet     1 2021-09-14 15:36:54
+ 2 horovod   chifflet     2 2021-09-14 17:06:57
+ 3 horovod   chifflet     4 2021-09-14 17:20:12
+ 4 horovod   chifflet     6 2021-09-14 17:18:35
+ 5 horovod   chifflet     8 2021-09-14 15:52:08
+ 6 horovod   chifflet    10 2021-09-14 16:11:03
+ 7 horovod   chifflet    12 2021-09-14 17:23:31
+ 8 horovod   chifflot     1 2021-10-03 16:56:55
+ 9 horovod   chifflot     2 2021-10-03 17:13:56
+10 horovod   chifflot     4 2021-10-03 17:28:01
+# … with 32 more rows
+
+# A tibble: 42 × 4
+   mean.start          framework machine   gpus
+   <dttm>              <chr>     <chr>    <int>
+ 1 2021-09-14 15:36:52 horovod   chifflet     1
+ 2 2021-09-14 17:06:55 horovod   chifflet     2
+ 3 2021-09-14 17:20:11 horovod   chifflet     4
+ 4 2021-09-14 17:18:34 horovod   chifflet     6
+ 5 2021-09-14 15:52:07 horovod   chifflet     8
+ 6 2021-09-14 16:11:02 horovod   chifflet    10
+ 7 2021-09-14 17:23:30 horovod   chifflet    12
+ 8 2021-10-03 16:56:54 horovod   chifflot     1
+ 9 2021-10-03 17:13:55 horovod   chifflot     2
+10 2021-10-03 17:28:00 horovod   chifflot     4
+# … with 32 more rows
+#+end_example
+
+Join data to get the time spent before starting the first batch processing
+#+begin_src R :results output :session *R* :exports both
+left_join(data1, data2, 
+          by = c("framework", "gpus", "machine")) %>%
+    group_by(framework, gpus, machine) %>% 
+    summarize(diff = min.start.epoch - mean.start) %>%
+    arrange(-diff) %>%
+    print -> df.diff 
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+`summarise()` has grouped output by 'framework', 'gpus'. You can override using the `.groups` argument.
+# A tibble: 42 × 4
+# Groups:   framework, gpus [14]
+   framework   gpus machine diff         
+   <chr>      <dbl> <chr>   <drtn>       
+ 1 tarantella    12 gemini  3.280477 secs
+ 2 horovod       12 gemini  3.181801 secs
+ 3 tarantella    10 gemini  3.009343 secs
+ 4 tarantella     8 gemini  2.855246 secs
+ 5 horovod       10 gemini  2.839703 secs
+ 6 horovod        8 gemini  2.557339 secs
+ 7 tarantella     6 gemini  2.451623 secs
+ 8 tarantella     4 gemini  2.248389 secs
+ 9 horovod        6 gemini  2.143272 secs
+10 horovod        2 gemini  2.085303 secs
+# … with 32 more rows
+#+end_example
+
+How representative is this time over all training time?
+Get training makespan
+#+begin_src R :results output :session *R* :exports both
+df.total %>%
+    filter(framework == "horovod" | framework == "tarantella") %>%
+    filter(batch==100) %>% 
+    group_by(framework, machine, gpus, batch) %>%
+    summarize(mean.makespan = mean(script.duration), .groups="drop") %>%
+    arrange(-mean.makespan) %>%
+    print -> df.total.makespan
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 42 × 5
+   framework  machine   gpus batch mean.makespan
+   <chr>      <chr>    <int> <int>         <dbl>
+ 1 horovod    chifflot     2   100          573.
+ 2 horovod    chifflet     2   100          491.
+ 3 tarantella chifflet     2   100          394.
+ 4 tarantella chifflet     1   100          393.
+ 5 tarantella chifflot     2   100          378.
+ 6 tarantella gemini       2   100          373.
+ 7 tarantella chifflot     1   100          373.
+ 8 tarantella gemini       1   100          367.
+ 9 horovod    gemini       2   100          316.
+10 tarantella chifflet     4   100          268.
+# … with 32 more rows
+#+end_example
+
+** Left join
+#+begin_src R :results output :session *R* :exports both
+left_join(df.diff, df.total.makespan, 
+          by = c("framework", "gpus", "machine")) %>%
+    group_by(framework, gpus, machine) %>% 
+    summarize(percentage = (as.numeric(diff)*100)/mean.makespan) %>%
+    arrange(-percentage) %>%
+    as.data.frame() -> per
+#+end_src
+
+#+RESULTS:
+: 
+: `summarise()` has grouped output by 'framework', 'gpus'. You can override using the `.groups` argument.
+
+
+#+begin_src R :results output :session *R* :exports both
+left_join(df.diff, per, 
+          by = c("framework", "gpus", "machine")) %>%
+    print %>% arrange(-diff) -> df.init.time
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 42 × 5
+# Groups:   framework, gpus [14]
+   framework   gpus machine diff          percentage
+   <chr>      <dbl> <chr>   <drtn>             <dbl>
+ 1 tarantella    12 gemini  3.280477 secs      2.00 
+ 2 horovod       12 gemini  3.181801 secs      7.72 
+ 3 tarantella    10 gemini  3.009343 secs      1.74 
+ 4 tarantella     8 gemini  2.855246 secs      1.50 
+ 5 horovod       10 gemini  2.839703 secs      6.21 
+ 6 horovod        8 gemini  2.557339 secs      4.83 
+ 7 tarantella     6 gemini  2.451623 secs      1.18 
+ 8 tarantella     4 gemini  2.248389 secs      0.849
+ 9 horovod        6 gemini  2.143272 secs      3.30 
+10 horovod        2 gemini  2.085303 secs      0.660
+# … with 32 more rows
+#+end_example
+
+** [Plot] Initialization for batch size 100
+#+begin_src R :results output file graphics :file ./../img/initialization-time-100batch-1rep-per.pdf :exports both :width 12 :height 6 :session *R* 
+df.init.time %>%
+    mutate(batch=100) %>%
+    rename_machines() %>%
+    mutate(l = paste(machine,type)) %>%
+    ggplot(aes(x = as.factor(gpus), y = diff)) + 
+    geom_bar(stat="identity", width=0.9, position = "dodge", fill="#FF9326") +
+    geom_text(size=5, 
+              aes(label=sprintf("%1.1f%%", percentage), y = diff), 
+              vjust=-0.5,group=1) +
+    my_theme() + 
+    theme(legend.position= "none", panel.grid.minor.x = element_blank(), 
+          panel.grid.major.x = element_blank(),
+                        strip.text.x = element_text(size = 20)) +
+    #scale_x_continuous("GPUs", lim=c(0,NA), breaks=c(1,2,4,6,8,10,12), expand=c(0,0)) +
+    scale_x_discrete("GPUs", breaks=c("1", "2", "4", "6", "8", "10", "12")) +
+    scale_y_continuous("Initialization Time [s]", 
+                       lim=c(0,4), expand=c(0,0), breaks=seq(0,20,1)) +
+    facet_nested_wrap(~Framework+m) 
+#+end_src
+
+#+RESULTS:
+[[file:./../img/initialization-time-100batch-1rep-per.pdf]]
+
+* Efficiency scaling
+*** Process data
+Get time with one GPU
+#+begin_src R :results output :session *R* :exports both
+df.total %>%
+    filter(framework != "tf" & framework != "nologhvd" & framework != "nologtnt") %>%
+    filter(gpus==1) %>%
+    group_by(framework, machine, gpus, batch) %>%
+    summarize(n=n(), time.onegpu=mean(duration), .groups.onegpu="drop") %>% 
+    print -> df.effone
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+`summarise()` has grouped output by 'framework', 'machine', 'gpus'. You can override using the `.groups` argument.
+# A tibble: 36 × 7
+# Groups:   framework, machine, gpus [6]
+   framework machine   gpus batch     n time.onegpu .groups.onegpu
+   <chr>     <chr>    <int> <int> <int>       <dbl> <chr>         
+ 1 horovod   chifflet     1   100    10        239. drop          
+ 2 horovod   chifflet     1   180    10        192. drop          
+ 3 horovod   chifflet     1   360    10        158. drop          
+ 4 horovod   chifflet     1   720    10        128. drop          
+ 5 horovod   chifflet     1  1500    10        121. drop          
+ 6 horovod   chifflet     1  2250    10        122. drop          
+ 7 horovod   chifflot     1   100    10        254. drop          
+ 8 horovod   chifflot     1   180    10        209. drop          
+ 9 horovod   chifflot     1   360    10        176. drop          
+10 horovod   chifflot     1   720    10        135. drop          
+# … with 26 more rows
+#+end_example
+
+Get time for all GPUs
+#+begin_src R :results output :session *R* :exports both
+df.total %>%
+    filter(gpus!=1) %>%
+    filter(framework != "tf" & framework != "nologhvd" & framework != "nologtnt") %>%
+    group_by(framework, machine, gpus, batch) %>%
+    summarize(n=n(), time=mean(duration), .groups="drop") %>% 
+    print -> df.effall
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 216 × 6
+   framework machine   gpus batch     n  time
+   <chr>     <chr>    <int> <int> <int> <dbl>
+ 1 horovod   chifflet     2   100    10 489. 
+ 2 horovod   chifflet     2   180    10 308. 
+ 3 horovod   chifflet     2   360    10 184. 
+ 4 horovod   chifflet     2   720    10 125. 
+ 5 horovod   chifflet     2  1500    10  95.0
+ 6 horovod   chifflet     2  2250    10  89.6
+ 7 horovod   chifflet     4   100    10 162. 
+ 8 horovod   chifflet     4   180    10 103. 
+ 9 horovod   chifflet     4   360    10  66.1
+10 horovod   chifflet     4   720    10  45.1
+# … with 206 more rows
+#+end_example
+
+Join to calculate the efficiency
+#+begin_src R :results output :session *R* :exports both
+left_join(df.effall, df.effone, by=c("framework", "machine", "batch")) %>%
+    mutate(efficiency=(time.onegpu/(time*gpus.x))*100) %>%
+    select(framework, machine, batch, gpus.x, efficiency, time, 
+           time.onegpu, everything(), -n.x, -n.y, -.groups.onegpu,
+           -gpus.y) %>% print -> df.efficiency
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 216 × 7
+   framework machine  batch gpus.x efficiency  time time.onegpu
+   <chr>     <chr>    <int>  <int>      <dbl> <dbl>       <dbl>
+ 1 horovod   chifflet   100      2       24.5 489.         239.
+ 2 horovod   chifflet   180      2       31.1 308.         192.
+ 3 horovod   chifflet   360      2       43.0 184.         158.
+ 4 horovod   chifflet   720      2       51.1 125.         128.
+ 5 horovod   chifflet  1500      2       63.5  95.0        121.
+ 6 horovod   chifflet  2250      2       68.2  89.6        122.
+ 7 horovod   chifflet   100      4       36.9 162.         239.
+ 8 horovod   chifflet   180      4       46.6 103.         192.
+ 9 horovod   chifflet   360      4       59.9  66.1        158.
+10 horovod   chifflet   720      4       70.9  45.1        128.
+# … with 206 more rows
+#+end_example
+
+#+begin_src R :results output :session *R* :exports both
+df.efficiency %>% arrange(-efficiency) %>% as.data.frame()
+#+end_src
+
+#+RESULTS:
+#+begin_example
+     framework  machine batch gpus.x efficiency      time time.onegpu
+1      horovod chifflot  2250      4   84.57585  37.65176    127.3772
+2      horovod   gemini  2250      4   84.37492  38.88336    131.2312
+3      horovod chifflet  2250      4   82.75347  36.90196    122.1506
+4      horovod   gemini  1500      4   82.52388  36.24725    119.6505
+5      horovod   gemini   720      4   81.67199  39.68694    129.6524
+6      horovod chifflot  2250      6   80.19470  26.47249    127.3772
+7      horovod chifflet  2250      6   80.14288  25.40267    122.1506
+8      horovod chifflot  1500      4   79.00271  40.14527    126.8634
+9      horovod chifflet  1500      4   78.83881  38.27904    120.7150
+10     horovod   gemini   360      4   78.55080  46.29268    145.4531
+11  tarantella chifflot  1500      2   78.10344  85.19574    133.0816
+12  tarantella chifflot  2250      2   77.83023  83.72560    130.3277
+13  tarantella   gemini  2250      2   77.53237  86.40837    133.9889
+14     horovod chifflot  1500      6   76.72196  27.55912    126.8634
+15     horovod chifflot  2250      8   76.42431  20.83388    127.3772
+16     horovod   gemini  2250      6   76.08191  28.74779    131.2312
+17     horovod chifflet  1500      6   75.72930  26.56721    120.7150
+18     horovod   gemini  2250      2   75.71428  86.66213    131.2312
+19  tarantella   gemini  1500      2   75.68743  82.61162    125.0532
+20  tarantella chifflet  2250      2   75.26988  83.92834    126.3455
+21  tarantella chifflet  1500      2   75.17646  85.73665    128.9075
+22     horovod chifflet  2250      8   74.58690  20.47119    122.1506
+23     horovod   gemini   720      6   74.26688  29.09607    129.6524
+24     horovod chifflot  1500      8   73.34014  21.62244    126.8634
+25     horovod   gemini   360      6   72.70556  33.34295    145.4531
+26     horovod   gemini  1500      6   72.66422  27.44371    119.6505
+27     horovod   gemini  1500      2   72.57911  82.42767    119.6505
+28     horovod   gemini   180      4   71.66414  56.74726    162.6697
+29     horovod chifflot  2250      2   71.09324  89.58460    127.3772
+30     horovod chifflet   720      4   70.86893  45.11772    127.8978
+31     horovod chifflot  2250     10   70.62488  18.03574    127.3772
+32  tarantella chifflot   720      2   70.22758 107.19895    150.5665
+33     horovod chifflot   720      4   70.09938  48.16008    135.0397
+34  tarantella   gemini   720      2   69.38243 102.99670    142.9232
+35     horovod chifflet  1500      8   69.22153  21.79866    120.7150
+36     horovod chifflot  2250     12   68.38021  15.52315    127.3772
+37     horovod chifflot  1500     10   68.21920  18.59643    126.8634
+38     horovod chifflet  2250      2   68.18979  89.56663    122.1506
+39     horovod chifflet  2250     10   68.18475  17.91465    122.1506
+40     horovod   gemini  2250      8   68.09568  24.08949    131.2312
+41     horovod chifflot   720      8   67.23194  25.10706    135.0397
+42     horovod chifflot  1500      2   66.91849  94.78949    126.8634
+43     horovod   gemini   180      6   66.55564  40.73528    162.6697
+44  tarantella chifflet   720      2   66.44638 108.05628    143.5990
+45     horovod chifflot  1500     12   66.32722  15.93908    126.8634
+46     horovod chifflet   720      6   66.30160  32.15050    127.8978
+47     horovod   gemini   720      8   66.02871  24.54471    129.6524
+48     horovod   gemini   360      8   65.57520  27.72639    145.4531
+49     horovod chifflet  2250     12   65.31920  15.58381    122.1506
+50     horovod   gemini  1500      8   65.17910  22.94649    119.6505
+51     horovod chifflet  1500     10   65.06185  18.55388    120.7150
+52     horovod chifflot   720      6   64.87657  34.69143    135.0397
+53     horovod   gemini   720      2   64.48833 100.52396    129.6524
+54  tarantella chifflot   360      2   64.40586 161.39639    207.8975
+55     horovod chifflet  1500      2   63.54495  94.98391    120.7150
+56     horovod chifflet   720      8   62.91497  25.41084    127.8978
+57     horovod chifflot   720     10   62.64632  21.55588    135.0397
+58     horovod chifflet  1500     12   62.29317  16.14877    120.7150
+59  tarantella   gemini   360      2   61.68656 144.88854    178.7535
+60     horovod chifflot   360      8   61.52453  35.73324    175.8776
+61  tarantella chifflet   360      2   61.20403 157.84876    193.2196
+62     horovod chifflot   360      4   60.80839  72.30813    175.8776
+63     horovod chifflet   720     10   59.96070  21.33026    127.8978
+64     horovod chifflet   360      4   59.87245  66.06189    158.2115
+65     horovod   gemini  2250     10   59.77305  21.95491    131.2312
+66     horovod   gemini   180      8   59.77299  34.01824    162.6697
+67     horovod   gemini   720     10   59.47539  21.79934    129.6524
+68     horovod   gemini   360     10   58.96647  24.66708    145.4531
+69     horovod chifflot   360     10   58.29240  30.17163    175.8776
+70     horovod chifflot   720     12   57.88019  19.44241    135.0397
+71     horovod   gemini  1500     10   57.45284  20.82587    119.6505
+72     horovod   gemini   100      4   57.42956  89.49912    205.5958
+73     horovod chifflet   360      6   55.91940  47.15463    158.2115
+74     horovod chifflot   360      6   55.62840  52.69420    175.8776
+75     horovod chifflet   720     12   55.18609  19.31310    127.8978
+76     horovod   gemini   180     10   54.98384  29.58501    162.6697
+77  tarantella chifflot   180      2   54.85853 247.96485    272.0597
+78     horovod   gemini   100      6   54.84347  62.47958    205.5958
+79  tarantella chifflot  2250      4   54.77096  59.48757    130.3277
+80     horovod chifflot   360     12   54.57918  26.85359    175.8776
+81     horovod chifflet   360      8   53.78691  36.76812    158.2115
+82     horovod   gemini  2250     12   53.50293  20.43988    131.2312
+83  tarantella   gemini   180      2   53.24332 228.38268    243.1970
+84     horovod   gemini   360     12   52.84728  22.93607    145.4531
+85     horovod chifflet   360     10   52.82166  29.95201    158.2115
+86  tarantella   gemini  2250      4   52.72750  63.52896    133.9889
+87     horovod   gemini   360      2   52.72292 137.94103    145.4531
+88     horovod   gemini   720     12   52.24350  20.68079    129.6524
+89     horovod chifflot   720      2   51.72206 130.54359    135.0397
+90  tarantella chifflot  1500      4   51.69251  64.36213    133.0816
+91  tarantella chifflet   180      2   51.65695 253.77079    262.1805
+92     horovod   gemini  1500     12   51.60116  19.32297    119.6505
+93     horovod   gemini   100      8   51.22382  50.17094    205.5958
+94  tarantella chifflet  2250      4   51.09202  61.82254    126.3455
+95     horovod chifflet   720      2   51.05436 125.25647    127.8978
+96     horovod   gemini   180     12   51.03982  26.55929    162.6697
+97  tarantella chifflet   100      2   49.96898 392.27170    392.0283
+98     horovod chifflet   360     12   49.74033  26.50624    158.2115
+99  tarantella chifflot   100      2   49.37713 376.68402    371.9915
+100    horovod chifflot   180      8   49.23142  53.03081    208.8626
+101 tarantella   gemini   100      2   49.21036 371.56730    365.6992
+102    horovod   gemini   100     10   48.38032  42.49575    205.5958
+103 tarantella chifflot   720      4   48.25655  78.00311    150.5665
+104 tarantella chifflet  1500      4   48.19312  66.87030    128.9075
+105 tarantella chifflot   360      4   47.61644 109.15215    207.8975
+106 tarantella   gemini  1500      4   47.48612  65.83673    125.0532
+107    horovod chifflot   180      4   47.27938 110.44063    208.8626
+108    horovod chifflot   180     10   46.99255  44.44589    208.8626
+109    horovod chifflet   180      4   46.62228 102.79757    191.7063
+110    horovod   gemini   100     12   45.49258  37.66105    205.5958
+111    horovod chifflot   180     12   45.01306  38.66704    208.8626
+112 tarantella chifflet   720      4   44.90052  79.95397    143.5990
+113 tarantella   gemini   720      4   44.56118  80.18370    142.9232
+114    horovod chifflot   360      2   43.76880 200.91669    175.8776
+115    horovod chifflet   180      6   43.66298  73.17650    191.7063
+116 tarantella chifflet   360      4   43.62946 110.71625    193.2196
+117    horovod chifflet   360      2   42.96948 184.09751    158.2115
+118    horovod chifflot   180      6   42.77397  81.38228    208.8626
+119 tarantella chifflot  2250      6   42.46010  51.15691    130.3277
+120 tarantella chifflot   180      4   42.15763 161.33482    272.0597
+121    horovod chifflet   180      8   41.94218  57.13410    191.7063
+122 tarantella   gemini   360      4   41.83890 106.81059    178.7535
+123    horovod chifflet   180     10   40.52478  47.30594    191.7063
+124    horovod chifflot   100      8   40.12830  79.09754    253.9240
+125    horovod   gemini   180      2   40.08160 202.92322    162.6697
+126 tarantella chifflot  1500      6   40.05826  55.37003    133.0816
+127 tarantella   gemini  2250      6   39.88142  55.99471    133.9889
+128    horovod chifflet   180     12   39.45793  40.48748    191.7063
+129 tarantella chifflet   180      4   39.05580 167.82430    262.1805
+130 tarantella chifflet  2250      6   38.96834  54.03768    126.3455
+131 tarantella chifflot   360      6   38.84525  89.19900    207.8975
+132    horovod chifflot   100     10   37.96075  66.89121    253.9240
+133 tarantella   gemini   180      4   37.86801 160.55573    243.1970
+134 tarantella chifflot   100      4   37.73161 246.47209    371.9915
+135 tarantella chifflet  1500      6   37.14672  57.83711    128.9075
+136    horovod chifflet   100      4   36.90283 162.12194    239.3103
+137    horovod chifflot   100      4   36.81780 172.41934    253.9240
+138 tarantella chifflot   720      6   36.81361  68.16612    150.5665
+139 tarantella chifflet   100      4   36.78410 266.43873    392.0283
+140 tarantella chifflot   180      6   36.04458 125.79780    272.0597
+141    horovod chifflot   100     12   35.87724  58.97983    253.9240
+142 tarantella   gemini  1500      6   35.57434  58.58775    125.0532
+143 tarantella chifflot  2250      8   34.86518  46.72558    130.3277
+144 tarantella   gemini   100      4   34.82010 262.56331    365.6992
+145 tarantella chifflet   360      6   34.44775  93.48439    193.2196
+146 tarantella chifflot   360      8   33.89425  76.67136    207.8975
+147    horovod chifflet   100      6   33.84647 117.84110    239.3103
+148 tarantella chifflot   180      8   33.54540 101.37743    272.0597
+149    horovod chifflot   100      6   33.43375 126.58068    253.9240
+150 tarantella chifflet   720      6   33.36352  71.73453    143.5990
+151 tarantella chifflot  1500      8   32.94141  50.49936    133.0816
+152    horovod   gemini   100      2   32.76723 313.72166    205.5958
+153    horovod chifflet   100      8   32.71428  91.43955    239.3103
+154 tarantella chifflot   100      6   32.62493 190.03440    371.9915
+155 tarantella   gemini   720      6   32.52062  73.24748    142.9232
+156 tarantella chifflet   180      6   32.40402 134.84978    262.1805
+157 tarantella   gemini   360      6   32.30448  92.22328    178.7535
+158    horovod chifflet   100     10   31.87019  75.08908    239.3103
+159 tarantella chifflet  2250      8   31.77222  49.70754    126.3455
+160 tarantella chifflet   100      6   31.63510 206.53660    392.0283
+161 tarantella chifflot   100      8   31.51354 147.55226    371.9915
+162 tarantella chifflot   720      8   31.19032  60.34182    150.5665
+163    horovod chifflet   180      2   31.07599 308.44761    191.7063
+164 tarantella   gemini  2250      8   31.01846  53.99563    133.9889
+165    horovod chifflet   100     12   30.93820  64.45922    239.3103
+166 tarantella   gemini   180      6   30.61960 132.37548    243.1970
+167    horovod chifflot   180      2   30.43646 343.11245    208.8626
+168 tarantella chifflot   180     10   30.36862  89.58582    272.0597
+169 tarantella chifflet  1500      8   29.73772  54.18520    128.9075
+170 tarantella chifflot   360     10   29.68321  70.03875    207.8975
+171 tarantella   gemini   100      6   29.62553 205.73426    365.6992
+172 tarantella chifflet   100      8   29.07186 168.56001    392.0283
+173 tarantella chifflet   180      8   28.77925 113.87568    262.1805
+174 tarantella chifflot   100     10   28.74701 129.40180    371.9915
+175 tarantella chifflet   360      8   28.69749  84.16225    193.2196
+176 tarantella chifflot  2250     10   28.28138  46.08249    130.3277
+177 tarantella chifflot  1500     10   28.08446  47.38620    133.0816
+178 tarantella chifflet   720      8   27.26229  65.84139    143.5990
+179 tarantella chifflot   180     12   27.09077  83.68771    272.0597
+180 tarantella chifflot   360     12   26.95237  64.27928    207.8975
+181 tarantella chifflot   100     12   26.52082 116.88663    371.9915
+182 tarantella chifflet   100     10   26.25737 149.30219    392.0283
+183 tarantella chifflot   720     10   26.21240  57.44093    150.5665
+184 tarantella chifflet   180     10   25.91259 101.17880    262.1805
+185 tarantella chifflet  2250     10   25.29658  49.94570    126.3455
+186 tarantella chifflot  1500     12   25.10648  44.17240    133.0816
+187 tarantella chifflet  1500     10   25.06767  51.42382    128.9075
+188 tarantella   gemini   720      8   25.04850  71.32324    142.9232
+189 tarantella chifflot  2250     12   24.91536  43.59013    130.3277
+190 tarantella chifflet   360     10   24.80978  77.88044    193.2196
+191 tarantella   gemini   360      8   24.71589  90.40415    178.7535
+192 tarantella   gemini   180      8   24.69031 123.12371    243.1970
+193    horovod chifflet   100      2   24.45040 489.37919    239.3103
+194 tarantella   gemini   100      8   24.37571 187.53259    365.6992
+195 tarantella   gemini  1500      8   24.30097  64.32522    125.0532
+196 tarantella chifflet   100     12   24.01631 136.02852    392.0283
+197 tarantella chifflot   720     12   23.70608  52.92821    150.5665
+198 tarantella   gemini  2250     10   23.70531  56.52274    133.9889
+199 tarantella chifflet   180     12   23.02376  94.89490    262.1805
+200 tarantella chifflet   720     10   22.80248  62.97515    143.5990
+201 tarantella chifflet   360     12   22.25900  72.33763    193.2196
+202    horovod chifflot   100      2   22.19790 571.95508    253.9240
+203 tarantella chifflet  2250     12   21.97633  47.90971    126.3455
+204 tarantella   gemini  1500     10   21.68227  57.67534    125.0532
+205 tarantella chifflet  1500     12   21.63114  49.66126    128.9075
+206 tarantella   gemini   100     10   21.48884 170.18101    365.6992
+207 tarantella   gemini   180     10   21.46451 113.30191    243.1970
+208 tarantella   gemini   360     10   21.05364  84.90385    178.7535
+209 tarantella   gemini   720     10   20.63779  69.25316    142.9232
+210 tarantella   gemini  2250     12   20.57200  54.27641    133.9889
+211 tarantella chifflet   720     12   20.16493  59.34354    143.5990
+212 tarantella   gemini   100     12   18.92652 161.01714    365.6992
+213 tarantella   gemini   360     12   18.82347  79.13590    178.7535
+214 tarantella   gemini   180     12   18.73359 108.18225    243.1970
+215 tarantella   gemini  1500     12   18.44147  56.50906    125.0532
+216 tarantella   gemini   720     12   17.66278  67.43144    142.9232
+#+end_example
+
+*** [Plot]
+#+begin_src R :results file graphics :file ./../img/efficiency.pdf :exports both :width 12 :height 6.5 :session *R* 
+df.efficiency %>%
+    rename_machines() %>%
+    mutate(t=paste(m, type)) %>%
+    ggplot(aes(x=gpus.x, y=efficiency, color=Framework)) +
+    geom_line() +
+    geom_point() +
+    my_theme() +  guides(color=guide_legend(nrow=1,byrow=TRUE,override.aes = list(size=5))) +
+    theme(panel.grid.minor.x = element_blank()) +
+    scale_color_brewer(palette = "Set1")  +
+    scale_x_continuous("GPUs", breaks=c(1, 2, 4, 6, 8, 10, 12)) +
+    scale_y_continuous("Efficiency [%]", lim=c(0,110), expand=c(0,0), breaks=seq(0,120,50)) +
+    facet_grid(m~batch) 
+#+end_src
+
+#+RESULTS:
+[[file:./../img/efficiency.pdf]]
+
+* Horovod + Score-P - 1500 batch size
+** Read traces
+#+begin_src R :results output :session *R* :exports both
+df <- fread("./../output/traces/batch-1500/1500-4gpus-10rep/traces.csv", 
+            header=FALSE,
+            fill=FALSE,
+            showProgress=FALSE) %>%
+    rename(
+        rank = V1,
+        start = V2,
+        end = V3,
+        depth = V4,
+        op = V5)
+df %>% as_tibble()
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 1,819,888 × 5
+      rank    start      end depth op                  
+   <int64>    <dbl>    <dbl> <int> <chr>               
+ 1       0 0        0.000024     0 pthread_mutex_lock  
+ 2       0 0.000029 0.000033     0 pthread_mutex_unlock
+ 3       0 0.000072 0.000073     0 pthread_mutex_lock  
+ 4       0 0.000075 0.000076     0 pthread_mutex_unlock
+ 5       1 0.000083 0.00011      0 pthread_mutex_lock  
+ 6       1 0.000115 0.000119     0 pthread_mutex_unlock
+ 7       1 0.000152 0.000153     0 pthread_mutex_lock  
+ 8       1 0.000155 0.000155     0 pthread_mutex_unlock
+ 9       2 0.00291  0.00294      0 pthread_mutex_lock  
+10       2 0.00294  0.00295      0 pthread_mutex_unlock
+# … with 1,819,878 more rows
+#+end_example
+** Classify operations
+
+#+begin_src R :results output :session *R* :exports both
+df %>%
+    as_tibble %>%
+    mutate(Type = case_when(
+               grepl("MPI_", op) ~ "MPI",
+               grepl("pthread_", op) ~ "pthread",
+               grepl("main", op) ~ "main",
+               grepl("user", op) ~ "user"
+           )) %>%
+    mutate(Operation = gsub("user_instrumenter:","", op)) %>%
+    select(-op) %>% print -> df.all
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 1,819,888 × 6
+      rank    start      end depth Type    Operation           
+   <int64>    <dbl>    <dbl> <int> <chr>   <chr>               
+ 1       0 0        0.000024     0 pthread pthread_mutex_lock  
+ 2       0 0.000029 0.000033     0 pthread pthread_mutex_unlock
+ 3       0 0.000072 0.000073     0 pthread pthread_mutex_lock  
+ 4       0 0.000075 0.000076     0 pthread pthread_mutex_unlock
+ 5       1 0.000083 0.00011      0 pthread pthread_mutex_lock  
+ 6       1 0.000115 0.000119     0 pthread pthread_mutex_unlock
+ 7       1 0.000152 0.000153     0 pthread pthread_mutex_lock  
+ 8       1 0.000155 0.000155     0 pthread pthread_mutex_unlock
+ 9       2 0.00291  0.00294      0 pthread pthread_mutex_lock  
+10       2 0.00294  0.00295      0 pthread pthread_mutex_unlock
+# … with 1,819,878 more rows
+#+end_example
+
+Renaming the threads number
+#+begin_src R :results output :session *R* :exports both
+df.all %>%
+    select(rank) %>%
+    distinct %>%
+    print %>%
+    arrange(rank) %>%
+    mutate(MPI.rank = 0:(n()-1)) %>% print -> df.mpi.rank
+
+df.all %>%
+    left_join(df.mpi.rank, by=c("rank")) %>%
+    select(MPI.rank, everything(), -rank) %>% print -> df.all.traces
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 52 × 1
+          rank
+       <int64>
+ 1           0
+ 2           1
+ 3           2
+ 4           3
+ 5  4294967297
+ 6  4294967296
+ 7  4294967299
+ 8  4294967298
+ 9 12884901889
+10  8589934593
+# … with 42 more rows
+# A tibble: 52 × 2
+         rank MPI.rank
+      <int64>    <int>
+ 1          0        0
+ 2          1        1
+ 3          2        2
+ 4          3        3
+ 5 4294967296        4
+ 6 4294967297        5
+ 7 4294967298        6
+ 8 4294967299        7
+ 9 8589934592        8
+10 8589934593        9
+# … with 42 more rows
+
+# A tibble: 1,819,888 × 6
+   MPI.rank    start      end depth Type    Operation           
+      <int>    <dbl>    <dbl> <int> <chr>   <chr>               
+ 1        0 0        0.000024     0 pthread pthread_mutex_lock  
+ 2        0 0.000029 0.000033     0 pthread pthread_mutex_unlock
+ 3        0 0.000072 0.000073     0 pthread pthread_mutex_lock  
+ 4        0 0.000075 0.000076     0 pthread pthread_mutex_unlock
+ 5        1 0.000083 0.00011      0 pthread pthread_mutex_lock  
+ 6        1 0.000115 0.000119     0 pthread pthread_mutex_unlock
+ 7        1 0.000152 0.000153     0 pthread pthread_mutex_lock  
+ 8        1 0.000155 0.000155     0 pthread pthread_mutex_unlock
+ 9        2 0.00291  0.00294      0 pthread pthread_mutex_lock  
+10        2 0.00294  0.00295      0 pthread pthread_mutex_unlock
+# … with 1,819,878 more rows
+#+end_example
+
+Checking the total execution time for each operation and the number of
+calls for each operation.
+#+begin_src R :results output :session *R* :exports both
+df.all.traces %>% filter(Type == "user") %>% filter(grepl("train", Operation)) %>%
+    select(-end,-depth,-Type) %>%
+    pivot_wider(values_from=c("start"), names_from="Operation") %>%
+    mutate(duration=round((train_end - train_begin), 2)) %>% arrange(MPI.rank) %>%
+    #mutate(across(starts_with("train"), round, 2)) %>%
+    as.data.frame()
+#+end_src
+
+#+RESULTS:
+: 
+:   MPI.rank train_begin train_end duration
+: 1        0    1.858693  56.26888    54.41
+: 2        1    1.563505  56.33522    54.77
+: 3        2    1.671511  56.32177    54.65
+: 4        3    1.607604  56.27229    54.66
+
+MPI all reduce total duration during the epochs processing, and
+overall duration, considering initialization and finalization time.
+#+begin_src R :results output :session *R* :exports both
+df.all.traces %>%
+    mutate(duration = end-start) %>%
+    group_by(MPI.rank, Operation,depth) %>%
+    summarize(n=n(), totalDuration = round(sum(duration),2)) %>%
+    arrange(-totalDuration) %>%
+    head(4) %>% arrange(MPI.rank) %>% as.data.frame() 
+#+end_src
+
+#+RESULTS:
+: 
+: `summarise()` has grouped output by 'MPI.rank', 'Operation'. You can override using the `.groups` argument.
+:   MPI.rank     Operation depth     n totalDuration
+: 1        4 MPI_Allreduce     0 29852         29.83
+: 2        5 MPI_Allreduce     0 29852         42.15
+: 3        6 MPI_Allreduce     0 29852         37.49
+: 4        7 MPI_Allreduce     0 29852         40.96
+
+** Epochs/batches interval times
+
+#+begin_src R :results output :session *R* :exports both
+df.all.traces %>%
+    filter(Type == "user") %>%
+    filter(Operation == "epoch_begin" | Operation == "epoch_end") %>%
+    group_by(MPI.rank) %>%
+    arrange(start) %>%
+    mutate(order = rep(seq(1,n()/2), each=2)) %>%
+    ungroup %>%
+    mutate(unique = MPI.rank * order + order ) %>%
+    group_by(MPI.rank) %>%
+    pivot_wider(values_from=c("start", "end"), names_from="Operation") %>%
+    mutate(Operation = "Epoch") %>%
+    select(-order, -unique, -start_epoch_end, -end_epoch_begin) %>% 
+    mutate(Type = "Epoch") %>% ungroup() %>% 
+    rename(start = start_epoch_begin,
+           end = end_epoch_end) -> df.epochs
+
+df.epochs %>% head(20) %>% as.data.frame()
+
+df.all.traces %>%
+    filter(Type == "user") %>%
+    filter(Operation == "batch_begin" | Operation == "batch_end") %>%
+    group_by(MPI.rank) %>%
+    arrange(start) %>%
+    mutate(order = rep(seq(1,n()/2), each=2)) %>%
+    ungroup %>%
+    mutate(unique = MPI.rank * order + order ) %>%
+    group_by(MPI.rank) %>%
+    pivot_wider(values_from=c("start", "end"), names_from="Operation") %>%
+    mutate(Operation = "Batch") %>%
+    select(-order, -unique, -start_batch_end, -end_batch_begin) %>% 
+    rename(start = start_batch_begin,
+           end = end_batch_end) %>% 
+    mutate(Type = "Batch") %>%
+    print -> df.batch
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+   MPI.rank depth  Type     start      end Operation
+1         1     0 Epoch  1.843846 11.19487     Epoch
+2         3     0 Epoch  1.887836 11.21053     Epoch
+3         2     0 Epoch  1.973754 11.31659     Epoch
+4         0     0 Epoch  2.173380 11.31872     Epoch
+5         1     0 Epoch 11.335870 16.30887     Epoch
+6         3     0 Epoch 11.352499 16.36478     Epoch
+7         2     0 Epoch 11.473467 16.29873     Epoch
+8         0     0 Epoch 11.478720 16.29750     Epoch
+9         2     0 Epoch 16.456462 21.26865     Epoch
+10        0     0 Epoch 16.457432 21.27212     Epoch
+11        1     0 Epoch 16.466243 21.27098     Epoch
+12        3     0 Epoch 16.507533 21.27372     Epoch
+13        1     0 Epoch 21.412452 26.19773     Epoch
+14        3     0 Epoch 21.415267 26.19918     Epoch
+15        2     0 Epoch 21.425444 26.19415     Epoch
+16        0     0 Epoch 21.430621 26.19679     Epoch
+17        1     0 Epoch 26.340948 31.10266     Epoch
+18        3     0 Epoch 26.341890 31.10295     Epoch
+19        2     0 Epoch 26.351152 31.10095     Epoch
+20        0     0 Epoch 26.353446 31.10337     Epoch
+
+# A tibble: 1,440 × 6
+# Groups:   MPI.rank [4]
+   MPI.rank depth Type  start   end Operation
+      <int> <int> <chr> <dbl> <dbl> <chr>    
+ 1        1     0 Batch  1.84  6.20 Batch    
+ 2        3     0 Batch  1.89  6.20 Batch    
+ 3        2     0 Batch  1.97  6.20 Batch    
+ 4        0     0 Batch  2.17  6.20 Batch    
+ 5        0     0 Batch  6.20  6.32 Batch    
+ 6        2     0 Batch  6.20  6.32 Batch    
+ 7        1     0 Batch  6.20  6.32 Batch    
+ 8        3     0 Batch  6.20  6.32 Batch    
+ 9        3     0 Batch  6.32  6.44 Batch    
+10        2     0 Batch  6.32  6.44 Batch    
+# … with 1,430 more rows
+#+end_example
+
+Join data about epochs, batch, and traces
+#+begin_src R :results output :session *R* :exports both
+rbind(df.all.traces, df.epochs, df.batch) %>%
+    filter(Type!="main") %>%
+    filter(Type!="user") %>% print -> df.all
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 1,806,528 × 6
+   MPI.rank    start      end depth Type    Operation           
+      <int>    <dbl>    <dbl> <int> <chr>   <chr>               
+ 1        0 0        0.000024     0 pthread pthread_mutex_lock  
+ 2        0 0.000029 0.000033     0 pthread pthread_mutex_unlock
+ 3        0 0.000072 0.000073     0 pthread pthread_mutex_lock  
+ 4        0 0.000075 0.000076     0 pthread pthread_mutex_unlock
+ 5        1 0.000083 0.00011      0 pthread pthread_mutex_lock  
+ 6        1 0.000115 0.000119     0 pthread pthread_mutex_unlock
+ 7        1 0.000152 0.000153     0 pthread pthread_mutex_lock  
+ 8        1 0.000155 0.000155     0 pthread pthread_mutex_unlock
+ 9        2 0.00291  0.00294      0 pthread pthread_mutex_lock  
+10        2 0.00294  0.00295      0 pthread pthread_mutex_unlock
+# … with 1,806,518 more rows
+#+end_example
+
+** Processing data
+#+begin_src R :results output :session *R* :exports both
+df.all.traces %>%
+    filter(Type == "user") %>%
+    filter(Operation == "batch_begin" | Operation == "batch_end") %>%
+    group_by(MPI.rank) %>%
+    arrange(start) %>%
+    mutate(order = rep(seq(1,n()/2), each=2)) %>%
+    ungroup %>%
+    mutate(unique = MPI.rank * order + order ) %>%
+    group_by(MPI.rank) %>%
+    pivot_wider(values_from=c("start", "end"), names_from="Operation") %>%
+    mutate(Operation = "Batch") %>%
+    select(-unique, -start_batch_end, -end_batch_begin) %>% 
+    rename(start = start_batch_begin,
+           end = end_batch_end) %>% 
+    mutate(Type = "Batch") -> df.batch
+
+df.batch %>%
+    filter(start >= 23.2) %>%
+    filter(end <=23.8) %>%
+    filter(Operation == "Batch") %>% as.data.frame() %>%
+    group_by(order) %>%
+    summarize(meanStart=(mean(start))) %>% select(meanStart) %>% as.data.frame() -> epoch1
+
+df.batch %>%
+    filter(start >= 23.2) %>%
+    filter(end <= 23.8) %>%
+    filter(Operation == "Batch") %>% as.data.frame() %>%
+    group_by(order) %>%
+    summarize(meanEnd=(mean(end))) %>% select(meanEnd) %>% as.data.frame() -> epoch2
+#+end_src
+
+#+RESULTS:
+
+#+begin_src R :results output :session *R* :exports both
+df.all %>% 
+    mutate(MPI.rank = ifelse(MPI.rank == 4, 0, MPI.rank)) %>%
+    mutate(MPI.rank = ifelse(MPI.rank == 5, 1, MPI.rank)) %>%
+    mutate(MPI.rank = ifelse(MPI.rank == 6, 2, MPI.rank)) %>%
+    mutate(MPI.rank = ifelse(MPI.rank == 7, 3, MPI.rank)) -> df.all.new
+#+end_src
+
+#+RESULTS:
+
+Get value for vertical green line
+#+begin_src R :results output :session *R* :exports both
+epoch2$meanEnd %>% as_tibble -> begin
+begin %>% as.data.frame()
+#+end_src
+
+#+RESULTS:
+: 
+:      value
+: 1 23.43521
+: 2 23.59287
+: 3 23.74885
+** [Plot] One epoch tracing with Score-P
+
+#+begin_src R :results output file graphics :file ./../img/scorep-1500.pdf :exports both :width 12 :height 4.7 :session *R*
+df.all.new %>%
+    filter(Operation != "Epoch") %>%
+    filter(start >= 21.412452) %>%
+    filter(end <= 26.19918) %>%
+    arrange(Operation) %>%
+    filter(Type != "pthread") %>%
+    mutate(range = if_else(Operation == "Batch", 0.9, 0.5)) %>%
+    ggplot(aes(xmin = start, xmax = end,
+               ymin = MPI.rank, 
+               ymax = MPI.rank + range,
+               fill = factor(Operation, levels=c("MPI_Allreduce", "Batch"))
+               )) +
+    geom_rect() + my_theme() + scale_fill_brewer(palette = "Set1") +
+    sapply(begin$value, function(xint) geom_vline(aes(xintercept = xint, color="Batch Init/End"),
+                                                  size=1.5, linetype="dashed")) +
+    scale_color_manual(name = "statistics", values = c(`Batch Init/End` = "green")) +
+    theme(legend.title = element_blank(), legend.position="top", panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank()) +
+    scale_x_continuous("Execution Time [s]", expand=c(0,0.05), breaks=seq(0,50,0.5)) +
+    scale_y_continuous("Worker", expand=c(0,0), lim=c(0,4), breaks=seq(0,10,1)) +
+    facet_zoom(xlim = c(23.48, 23.705), zoom.size = 0.8)
+#+end_src
+
+#+RESULTS:
+[[file:./../img/scorep-1500.pdf]]
+
+* Keras Callbacks + NVProf
+
+Experiments for 10 epochs with 2 ranks (one each node) and batch size
+2250, in the Grid cluster.
+
+** Clean CSV files
+
+Remove NVProf headers and tail to read with R
+#+begin_src shell :results output :exports both
+FILEPATH=./../output/nvprof-grid/
+for file in $FILEPATH/*/nvprof*.csv; do
+
+    if [ -f "$file-original" ]; then
+	    echo "File already proceesed."
+	else
+	    cp $file $file-original
+	    sed -i '/^==/d' $file
+	    sed -i '1,2d' $file
+    fi
+done
+#+end_src
+
+#+RESULTS:
+
+** Process CSV
+#+begin_src shell :results output :exports both
+FILENAME=./../output/nvprof-grid/output.csv
+rm $FILENAME
+FILEPATH=./../output/nvprof-grid/
+
+echo "Start,Duration,GridX,GridZ,GridY,BlockX,BlockZ,BlockY,RegistersPerThread,StaticSMem,DynamicSMem,Size,Throughput,SrcMemType,DstMemType,Device,Context,Stream,Name,Correlation,Id,Framework" >> $FILENAME
+{
+for file in $FILEPATH/*/*.csv; do
+    id=`echo $file | sed 's/.*-//;s/.csv.*//'`
+    framework=`echo $file | cut -d\/ -f6 | cut -d "-" -f4`
+    sed "s/$/,$id,$framework/g" $file
+done
+} >> $FILENAME
+#+end_src
+
+#+RESULTS:
+
+** Keras callbacks
+*** Process
+#+begin_src shell :results output :exports both
+FILENAME=./../output/nvprof-grid/callbacks.csv
+if [[ -f $FILENAME ]]; then
+    rm $FILENAME
+fi
+
+machine=gemini
+FILEPATH=./../output/nvprof-grid/
+
+echo "machine,framework,event.type,rank,time.temp,operation,type,parameter,garbage" >> $FILENAME
+{
+    for file in $FILEPATH/*/logfile*; do
+	    framework=`echo $file | cut -d\/ -f6 | cut -d "-" -f4`
+	    cat $file | grep on_train | sed "s/^/${machine},${framework},/"
+	    cat $file | grep on_epoch | sed "s/^/${machine},${framework},/"
+	    cat $file | grep on_test | sed "s/^/${machine},${framework},/"
+    done
+} >> $FILENAME
+#+end_src
+
+#+RESULTS:
+
+*** Read
+#+begin_src R :results output :session *R* :exports both
+read_csv("./../output/nvprof-grid/callbacks.csv", progress=FALSE) %>%
+    mutate(parameter = as.integer(gsub("\\(", "", parameter))) %>%
+    select(-garbage, -type) %>% 
+    arrange(time.temp) %>%
+    print -> df.callbacks 
+
+df.callbacks %>% distinct(operation)
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+Rows: 1928 Columns: 9
+── Column specification ────────────────────────────────────────────────────────────────────────────────
+Delimiter: ","
+chr  (7): machine, framework, event.type, operation, type, parameter, garbage
+dbl  (1): rank
+dttm (1): time.temp
+
+ℹ Use `spec()` to retrieve the full column specification for this data.
+ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+# A tibble: 1,928 × 7
+   machine framework  event.type  rank time.temp           operation   parameter
+   <chr>   <chr>      <chr>      <dbl> <dttm>              <chr>           <int>
+ 1 gemini  tarantella start          0 2021-10-24 05:14:26 on_train_b…        NA
+ 2 gemini  tarantella start          1 2021-10-24 05:14:26 on_train_b…        NA
+ 3 gemini  tarantella start          0 2021-10-24 05:14:26 on_epoch_b…         0
+ 4 gemini  tarantella start          0 2021-10-24 05:14:26 on_train_b…         0
+ 5 gemini  tarantella start          1 2021-10-24 05:14:26 on_epoch_b…         0
+ 6 gemini  tarantella start          1 2021-10-24 05:14:26 on_train_b…         0
+ 7 gemini  tarantella end            0 2021-10-24 05:14:29 on_train_b…         0
+ 8 gemini  tarantella start          0 2021-10-24 05:14:29 on_train_b…         1
+ 9 gemini  tarantella end            1 2021-10-24 05:14:29 on_train_b…         0
+10 gemini  tarantella start          1 2021-10-24 05:14:29 on_train_b…         1
+# … with 1,918 more rows
+Warning messages:
+1: Problem with `mutate()` column `parameter`.
+ℹ `parameter = as.integer(gsub("\\(", "", parameter))`.
+ℹ One or more parsing issues, see `problems()` for details 
+2: Problem with `mutate()` column `parameter`.
+ℹ `parameter = as.integer(gsub("\\(", "", parameter))`.
+ℹ NAs introduced by coercion
+
+# A tibble: 10 × 1
+   operation           
+   <chr>               
+ 1 on_train_begin      
+ 2 on_epoch_begin      
+ 3 on_train_batch_begin
+ 4 on_train_batch_end  
+ 5 on_test_begin       
+ 6 on_test_batch_begin 
+ 7 on_test_batch_end   
+ 8 on_test_end         
+ 9 on_epoch_end        
+10 on_train_end
+#+end_example
+
+*** Train duration 
+#+begin_src R :results output :session *R* :exports both
+df.callbacks %>%
+    filter(str_detect(operation, 'train_begin')) %>%
+    select(-operation) -> d1
+
+df.callbacks %>%
+    filter(str_detect(operation, 'train_end')) %>%
+    select(-operation) -> d2
+
+rbind(d1, d2) %>%
+    group_by(framework, rank) %>%
+    arrange(time.temp) %>%
+    mutate(order = rep(seq(1,n()/2), each=2)) %>%
+    ungroup %>%
+    mutate(unique = rank * order + order) %>%
+    group_by(framework, rank) %>%
+    pivot_wider(values_from="time.temp", names_from="event.type") %>%
+    arrange(start) %>%
+    mutate(s = as.numeric(as.POSIXct(start)),
+           e = as.numeric(as.POSIXct(end)),
+           duration = e-s) %>% 
+    select(-order, -unique, -parameter) %>%
+    select(duration, everything())
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 4 × 8
+# Groups:   framework, rank [4]
+  duration machine framework   rank start               end                
+     <dbl> <chr>   <chr>      <dbl> <dttm>              <dttm>             
+1     12.1 gemini  tarantella     0 2021-10-24 05:14:26 2021-10-24 05:14:38
+2     12.1 gemini  tarantella     1 2021-10-24 05:14:26 2021-10-24 05:14:38
+3     15.3 gemini  horovod        0 2021-11-08 04:14:50 2021-11-08 04:15:06
+4     14.9 gemini  horovod        1 2021-11-08 04:14:51 2021-11-08 04:15:06
+# … with 2 more variables: s <dbl>, e <dbl>
+#+end_example
+
+*** Epochs duration 
+#+begin_src R :results output :session *R* :exports both
+df.callbacks %>%
+    filter(str_detect(operation, 'epoch_') ) %>%
+    select(-operation) %>%
+    group_by(framework, rank) %>%
+    arrange(time.temp) %>%
+    mutate(order = rep(seq(1,n()/2), each=2)) %>%
+    ungroup %>%
+    mutate(unique = rank * order + order) %>%
+    group_by(framework, rank) %>%
+    pivot_wider(values_from="time.temp", names_from="event.type") %>%
+    mutate(epoch = parameter) %>%
+    arrange(start) %>%
+    mutate(s = as.numeric(as.POSIXct(start)),
+           e = as.numeric(as.POSIXct(end))) %>% 
+    select(-order, -unique,-parameter) %>%
+    print -> df.epoch
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 40 × 8
+# Groups:   framework, rank [4]
+   machine framework   rank start               end                 epoch      s
+   <chr>   <chr>      <dbl> <dttm>              <dttm>              <int>  <dbl>
+ 1 gemini  tarantella     0 2021-10-24 05:14:26 2021-10-24 05:14:30     0 1.64e9
+ 2 gemini  tarantella     1 2021-10-24 05:14:26 2021-10-24 05:14:30     0 1.64e9
+ 3 gemini  tarantella     0 2021-10-24 05:14:30 2021-10-24 05:14:31     1 1.64e9
+ 4 gemini  tarantella     1 2021-10-24 05:14:30 2021-10-24 05:14:31     1 1.64e9
+ 5 gemini  tarantella     0 2021-10-24 05:14:31 2021-10-24 05:14:32     2 1.64e9
+ 6 gemini  tarantella     1 2021-10-24 05:14:31 2021-10-24 05:14:32     2 1.64e9
+ 7 gemini  tarantella     0 2021-10-24 05:14:32 2021-10-24 05:14:33     3 1.64e9
+ 8 gemini  tarantella     1 2021-10-24 05:14:32 2021-10-24 05:14:33     3 1.64e9
+ 9 gemini  tarantella     1 2021-10-24 05:14:33 2021-10-24 05:14:34     4 1.64e9
+10 gemini  tarantella     0 2021-10-24 05:14:33 2021-10-24 05:14:34     4 1.64e9
+# … with 30 more rows, and 1 more variable: e <dbl>
+#+end_example
+
+*** Batches duration 
+#+begin_src R :results output :session *R* :exports both
+df.callbacks %>%
+    filter(str_detect(operation, 'batch_') ) %>%
+    select(-operation) %>%
+    group_by(framework, rank) %>%
+    arrange(time.temp) %>%
+    mutate(order = rep(seq(1,n()/2), each=2)) %>%
+    ungroup %>%
+    mutate(unique = rank * order + order) %>%
+    group_by(framework, rank) %>%
+    pivot_wider(values_from="time.temp", names_from="event.type") %>%
+    mutate(batch = parameter) %>%
+    arrange(start) %>%
+    mutate(s = as.numeric(as.POSIXct(start)),
+           e = as.numeric(as.POSIXct(end))) %>% 
+    select(-order, -unique,-parameter)  -> df.batch
+df.batch
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 880 × 8
+# Groups:   framework, rank [4]
+   machine framework   rank start               end                 batch      s
+   <chr>   <chr>      <dbl> <dttm>              <dttm>              <int>  <dbl>
+ 1 gemini  tarantella     0 2021-10-24 05:14:26 2021-10-24 05:14:29     0 1.64e9
+ 2 gemini  tarantella     1 2021-10-24 05:14:26 2021-10-24 05:14:29     0 1.64e9
+ 3 gemini  tarantella     0 2021-10-24 05:14:29 2021-10-24 05:14:29     1 1.64e9
+ 4 gemini  tarantella     1 2021-10-24 05:14:29 2021-10-24 05:14:29     1 1.64e9
+ 5 gemini  tarantella     0 2021-10-24 05:14:29 2021-10-24 05:14:29     2 1.64e9
+ 6 gemini  tarantella     1 2021-10-24 05:14:29 2021-10-24 05:14:29     2 1.64e9
+ 7 gemini  tarantella     0 2021-10-24 05:14:29 2021-10-24 05:14:29     3 1.64e9
+ 8 gemini  tarantella     1 2021-10-24 05:14:29 2021-10-24 05:14:29     3 1.64e9
+ 9 gemini  tarantella     1 2021-10-24 05:14:29 2021-10-24 05:14:29     4 1.64e9
+10 gemini  tarantella     0 2021-10-24 05:14:29 2021-10-24 05:14:29     4 1.64e9
+# … with 870 more rows, and 1 more variable: e <dbl>
+#+end_example
+
+** Read NVProf (CSV) and classify operations
+#+begin_src R :results output :session *R* :exports both
+df <- read_csv("./../output/nvprof-grid/output.csv", progress=FALSE,col_types = cols())
+
+df %>% select(-"GridX", -"GridZ", -"GridY",
+              -"BlockX", -"BlockY", -"BlockZ",
+              -"RegistersPerThread") %>% 
+    rename(StaticMem="StaticSMem",
+           DynMem="DynamicSMem") %>%
+    mutate_at(c("Start", "Duration", "Size", "Throughput", "StaticMem", "DynMem"), as.numeric) %>%
+    mutate(Dur = Duration/1000) %>% # Convert duration from ms to s
+    mutate(End = Start + Dur) %>%
+    select(Id, everything()) %>% print -> df.all
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 103,164 × 17
+      Id Start Duration StaticMem DynMem      Size Throughput SrcMemType
+   <dbl> <dbl>    <dbl>     <dbl>  <dbl>     <dbl>      <dbl> <chr>     
+ 1 11205  1.60 0.00128         NA     NA  0.00098     0.748   Device    
+ 2 11205  1.60 0.00576          0      0 NA          NA       <NA>      
+ 3 11205  1.60 0.000704        NA     NA  0.000004    0.00529 Pageable  
+ 4 11205  1.60 0.000736        NA     NA  0.000004    0.00506 Pageable  
+ 5 11205  1.60 0.00288          0      0 NA          NA       <NA>      
+ 6 11205  1.60 0.00253          0      0 NA          NA       <NA>      
+ 7 11205  1.60 0.0024           0      0 NA          NA       <NA>      
+ 8 11205  1.60 0.000801        NA     NA  0.000004    0.00465 Pageable  
+ 9 11205  1.60 0.0024           0      0 NA          NA       <NA>      
+10 11205  1.61 0.00528          0      0 NA          NA       <NA>      
+# … with 103,154 more rows, and 9 more variables: DstMemType <chr>,
+#   Device <chr>, Context <dbl>, Stream <dbl>, Name <chr>, Correlation <dbl>,
+#   Framework <chr>, Dur <dbl>, End <dbl>
+#+end_example
+
+#+begin_src R :results output :session *R* :exports both
+df.all %>%  mutate(Type = case_when(
+                          grepl("implicit_convolve_sgemm", Name) ~ "implicit_convolve_sgemm",
+                          grepl("explicit_convolve_sgemm", Name) ~ "explicit_convolve_sgemm",
+                          grepl("gemv2T_kernel_val", Name) ~ "gemv2T_kernel_val",
+                          grepl("gemv2N_kernel", Name) ~ "gemv2N_kernel",
+                          grepl("Eigen", Name) ~ "eigen",
+                          grepl("gemmk1", Name) ~ "gemmk1",
+                          grepl("sgemm", Name) ~ "sgemm",
+                          grepl("winograd", Name) ~ "winograd",
+                          grepl("pooling", Name) ~ "pooling",
+                          grepl("fft2d", Name) ~ "cuFFT",
+                          grepl("im2col4d", Name) ~ "im2col4d",
+                          grepl("nhwcToNchwKernel", Name) ~ "nhwcToNchwKernel",
+                          grepl("nchwToNhwcKernel", Name) ~ "nchwToNhwcKernel",
+                          grepl("tensorflow", Name) ~ "tensorflow",                          
+                          grepl("splitKreduce_kernel", Name) ~ "splitKreduce_kernel",
+                          grepl("FillPhiloxRandomKernelLaunch", Name) ~ "FillPhiloxRandomKernelLaunch",
+                          grepl("flip_filter", Name) ~ "flip_filter",
+                          grepl("compute", Name) ~ "kernelCompute",
+                          grepl("horovod::common::batched_scaled_memcpy_k", Name) ~ "horovod::batched_scaled_memcpy_k",
+                          grepl("horovod::common::scale_buffer_k", Name) ~ "horovod::scale_buffer_k",
+                          grepl("scal_kernel", Name) ~ "scal_kernel",
+                          grepl("cudnn", Name) ~ "cudnn",
+                          TRUE ~ Name
+           )) %>%
+    arrange(Framework, Start) -> df.nvprof.csv
+#+end_src
+
+#+RESULTS:
+
+** Read NVProf (nvvp) to get timestamp
+#+begin_src R :results output :session *R* :exports both
+read_nvvp <- function(file_name){
+
+    dbConnect(RSQLite::SQLite(), file_name) %>%
+        dbReadTable('CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL') %>%
+        select(start, end, deviceId) %>% as_tibble() -> table_1
+
+    dbConnect(RSQLite::SQLite(), file_name) %>%
+        dbReadTable('CUPTI_ACTIVITY_KIND_MEMCPY') %>%
+        select(start, end, deviceId) %>%  as_tibble() -> table_2
+
+    dbConnect(RSQLite::SQLite(), file_name) %>%
+        dbReadTable('CUPTI_ACTIVITY_KIND_MEMSET') %>%
+        select(start, end, deviceId) %>% as_tibble() -> table_3
+    
+    bind_rows(table_1, table_2, table_3) %>%
+        mutate(a = gsub(".*nvprof-", "", file_name)) %>%
+        mutate(processID = gsub(a, pattern=".nvvp$", replacement="")) %>%
+        mutate(framework = case_when(
+                   grepl("tarantella", file_name) ~ "tarantella",
+                   grepl("horovod", file_name) ~ "horovod")) 
+}
+
+csv_files <- list.files(path = "./../output/nvprof-grid/", pattern = "*.nvvp$", recursive = TRUE, all.files = TRUE, full.names = TRUE)
+if(length(csv_files) != 0) {	
+    lapply(csv_files, read_nvvp) %>%
+        bind_rows %>%
+        arrange(start) %>%
+        mutate(start.date = force_tz(as.POSIXct(start/1000000000, origin="1970-01-01", tz="CET"), tzone = "", roll = FALSE),
+               end.date = force_tz(as.POSIXct(end/1000000000, origin="1970-01-01"), tz="CET"), tzone = "", roll = FALSE) %>%
+        select(-a,-tzone,-roll) %>%
+        rename(start.timestamp = start, end.timestamp=end) %>%
+        arrange(framework, start.date) %>% print -> df.nvprof.nvvp
+}
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 103,164 × 7
+   start.timestamp end.timestamp deviceId processID framework
+           <int64>       <int64>    <int> <chr>     <chr>    
+ 1           1.e18         1.e18        0 11205     horovod  
+ 2           1.e18         1.e18        0 11205     horovod  
+ 3           1.e18         1.e18        0 11205     horovod  
+ 4           1.e18         1.e18        0 11205     horovod  
+ 5           1.e18         1.e18        0 11205     horovod  
+ 6           1.e18         1.e18        0 11205     horovod  
+ 7           1.e18         1.e18        0 11205     horovod  
+ 8           1.e18         1.e18        0 11205     horovod  
+ 9           1.e18         1.e18        0 11205     horovod  
+10           1.e18         1.e18        0 11205     horovod  
+# … with 103,154 more rows, and 2 more variables: start.date <dttm>,
+#   end.date <dttm>
+#+end_example
+** Pre-process for both
+Get zeros for each process using the nvprof nvvp file
+#+begin_src R :results output :session *R* :exports both
+df.nvprof.nvvp %>%
+    filter(framework == "tarantella") %>%
+    filter(processID == 7873) %>%
+    arrange(start.date) %>%
+    head(1) %>% as.data.frame() %>% print -> df.zero.7873
+
+df.nvprof.nvvp %>%
+    filter(framework == "tarantella") %>%
+    filter(processID == 53959) %>%
+    arrange(start.date) %>%
+    head(1) %>% as.data.frame() %>% print -> df.zero.53959
+
+df.nvprof.nvvp %>%
+    filter(framework == "horovod") %>%
+    filter(processID == 11205) %>%
+    arrange(start.date) %>%
+    head(1) %>% as.data.frame() %>% print -> df.zero.11205
+
+df.nvprof.nvvp %>%
+    filter(framework == "horovod") %>%
+    filter(processID == 55839) %>%
+    arrange(start.date) %>%
+    head(1) %>% as.data.frame() %>% print -> df.zero.55839
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+      start.timestamp       end.timestamp deviceId processID  framework
+1 1635045265981853236 1635045265981854517        0      7873 tarantella
+           start.date            end.date
+1 2021-10-24 05:14:25 2021-10-23 23:14:25
+
+      start.timestamp       end.timestamp deviceId processID  framework
+1 1635045266063339420 1635045266063340796        0     53959 tarantella
+           start.date            end.date
+1 2021-10-24 05:14:26 2021-10-23 23:14:26
+
+      start.timestamp       end.timestamp deviceId processID framework
+1 1636341290527616687 1636341290527617967        0     11205   horovod
+           start.date            end.date
+1 2021-11-08 04:14:50 2021-11-07 22:14:50
+
+      start.timestamp       end.timestamp deviceId processID framework
+1 1636341290889930731 1636341290889932011        0     55839   horovod
+           start.date            end.date
+1 2021-11-08 04:14:50 2021-11-07 22:14:50
+#+end_example
+
+#+begin_src R :results output :session *R* :exports both
+df.nvprof.csv %>%
+    group_by(Framework) %>%
+    arrange(Start) %>%
+    select(Id) %>%
+    distinct %>%
+    mutate(rank = 0:(n()-1)) %>% 
+    ungroup() %>% print -> df.mpi.rank
+
+df.nvprof.csv %>%
+    group_by(Framework) %>%
+    left_join(df.mpi.rank, by=c("Id", "Framework")) %>%
+    select(rank, Start, End, Duration, everything(), -Id) %>% 
+    arrange(Start) %>% 
+    ungroup() %>%
+    group_by(Framework, rank) %>%
+    mutate(S = Start - min(Start)) %>%
+    mutate(E = End - min(Start)) %>%
+    ungroup() %>%
+    print -> df.nvprof.rank
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+Adding missing grouping variables: `Framework`
+# A tibble: 4 × 3
+  Framework     Id  rank
+  <chr>      <dbl> <int>
+1 tarantella  7873     0
+2 horovod    11205     0
+3 tarantella 53959     1
+4 horovod    55839     1
+
+# A tibble: 103,164 × 20
+    rank Start   End Duration StaticMem DynMem      Size Throughput SrcMemType
+   <int> <dbl> <dbl>    <dbl>     <dbl>  <dbl>     <dbl>      <dbl> <chr>     
+ 1     0  1.52  1.52 0.00128         NA     NA  0.00098     0.747   Device    
+ 2     0  1.52  1.52 0.00573          0      0 NA          NA       <NA>      
+ 3     0  1.52  1.52 0.000768        NA     NA  0.000004    0.00485 Pageable  
+ 4     0  1.52  1.52 0.000768        NA     NA  0.000004    0.00485 Pageable  
+ 5     0  1.52  1.52 0.00294          0      0 NA          NA       <NA>      
+ 6     0  1.52  1.52 0.00259          0      0 NA          NA       <NA>      
+ 7     0  1.52  1.52 0.00246          0      0 NA          NA       <NA>      
+ 8     0  1.53  1.53 0.000768        NA     NA  0.000004    0.00485 Pageable  
+ 9     0  1.53  1.53 0.00253          0      0 NA          NA       <NA>      
+10     0  1.54  1.54 0.00525          0      0 NA          NA       <NA>      
+# … with 103,154 more rows, and 11 more variables: DstMemType <chr>,
+#   Device <chr>, Context <dbl>, Stream <dbl>, Name <chr>, Correlation <dbl>,
+#   Framework <chr>, Dur <dbl>, Type <chr>, S <dbl>, E <dbl>
+#+end_example
+** Process data - Tarantella
+
+Setting new zero for Keras - tarantella:
+#+begin_src R :results output :session *R* :exports both
+df.epoch %>%
+    filter(framework == "tarantella") %>%
+    filter(rank == 0) %>%
+    mutate(Start = force_tz(start, tzone = "", roll = FALSE) - df.zero.7873$start.date) %>%
+    mutate(End = force_tz(end, tzone = "", roll = FALSE) - df.zero.7873$start.date) -> d1
+
+df.epoch %>%
+    filter(framework == "tarantella") %>%
+    filter(rank == 1) %>%
+    mutate(Start = force_tz(start, tzone = "", roll = FALSE) - df.zero.53959$start.date) %>%
+    mutate(End = force_tz(end, tzone = "", roll = FALSE) - df.zero.53959$start.date) -> d2
+
+rbind(d1, d2) %>% print -> df.epoch.newzero
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 20 × 10
+# Groups:   framework, rank [2]
+   machine framework   rank start               end                 epoch      s
+   <chr>   <chr>      <dbl> <dttm>              <dttm>              <int>  <dbl>
+ 1 gemini  tarantella     0 2021-10-24 05:14:26 2021-10-24 05:14:30     0 1.64e9
+ 2 gemini  tarantella     0 2021-10-24 05:14:30 2021-10-24 05:14:31     1 1.64e9
+ 3 gemini  tarantella     0 2021-10-24 05:14:31 2021-10-24 05:14:32     2 1.64e9
+ 4 gemini  tarantella     0 2021-10-24 05:14:32 2021-10-24 05:14:33     3 1.64e9
+ 5 gemini  tarantella     0 2021-10-24 05:14:33 2021-10-24 05:14:34     4 1.64e9
+ 6 gemini  tarantella     0 2021-10-24 05:14:34 2021-10-24 05:14:35     5 1.64e9
+ 7 gemini  tarantella     0 2021-10-24 05:14:35 2021-10-24 05:14:35     6 1.64e9
+ 8 gemini  tarantella     0 2021-10-24 05:14:36 2021-10-24 05:14:36     7 1.64e9
+ 9 gemini  tarantella     0 2021-10-24 05:14:36 2021-10-24 05:14:37     8 1.64e9
+10 gemini  tarantella     0 2021-10-24 05:14:37 2021-10-24 05:14:38     9 1.64e9
+11 gemini  tarantella     1 2021-10-24 05:14:26 2021-10-24 05:14:30     0 1.64e9
+12 gemini  tarantella     1 2021-10-24 05:14:30 2021-10-24 05:14:31     1 1.64e9
+13 gemini  tarantella     1 2021-10-24 05:14:31 2021-10-24 05:14:32     2 1.64e9
+14 gemini  tarantella     1 2021-10-24 05:14:32 2021-10-24 05:14:33     3 1.64e9
+15 gemini  tarantella     1 2021-10-24 05:14:33 2021-10-24 05:14:34     4 1.64e9
+16 gemini  tarantella     1 2021-10-24 05:14:34 2021-10-24 05:14:35     5 1.64e9
+17 gemini  tarantella     1 2021-10-24 05:14:35 2021-10-24 05:14:35     6 1.64e9
+18 gemini  tarantella     1 2021-10-24 05:14:36 2021-10-24 05:14:36     7 1.64e9
+19 gemini  tarantella     1 2021-10-24 05:14:36 2021-10-24 05:14:37     8 1.64e9
+20 gemini  tarantella     1 2021-10-24 05:14:37 2021-10-24 05:14:38     9 1.64e9
+# … with 3 more variables: e <dbl>, Start <drtn>, End <drtn>
+#+end_example
+
+Group batch and NVProf output to the same plot
+#+begin_src R :results output :session *R* :exports both
+df.epoch.newzero %>%
+    filter(framework == "tarantella") %>%
+    mutate(S = as.numeric(Start)) %>%
+    mutate(E = as.numeric(End)) %>%
+    select(rank, S, E) %>%
+    mutate(rank = rank + 0.5) %>%
+    mutate(Type = "Epoch") -> df.e
+
+df.nvprof.rank %>%
+    filter(Framework == "tarantella") %>%
+    filter(Stream == 14) %>% # checking the data and NVProf we confirmed this thread does the computations
+    select(rank, S, E) %>%
+    mutate(Type = "NVProf") -> df.nvp
+
+rbind(df.e, df.nvp) -> df.epoch.nvvp.tnt
+#+end_src
+
+#+RESULTS:
+: 
+: Adding missing grouping variables: `framework`
+
+** [Plot] NVProf - Tarantella
+#+begin_src R :results output file graphics :file ./../img/nvprof-tnt-operations2.pdf :exports both :width 12 :height 8 :session *R*
+df.epoch.nvvp.tnt %>%
+    ggplot(aes(xmin = S, xmax= E,
+               ymin = rank, ymax = rank + 0.5,
+               fill = as.factor(Type))) +
+    geom_rect() + my_theme() +  
+    scale_fill_manual(values=c("orange", "#76b900")) +
+    theme(legend.title=element_blank(), 
+          panel.grid.major.y = element_blank(), 
+          axis.text.x = element_text(angle = 30, vjust = 1, hjust=0.6),
+          panel.grid.minor.y = element_blank()) +
+    geom_vline(xintercept=c(3.239,3.261), color="red", size=0.8, alpha=1) +
+    scale_y_continuous("GPUs", expand=c(0,0), breaks=seq(0,1,1)) +
+    scale_x_continuous("Execution Time [s]", expand=c(0,0), breaks=seq(0,100,0.6)) +
+    facet_zoom(xlim = c(2.88,3.82), zoom.size = 0.9) -> p1
+
+Compute.Stream <- 14 # We confirm this Stream performs computations using the NVProf and measures analysis
+# Get legend in order of appearance and only for the time interval:
+df.nvprof.rank %>%
+    filter(Framework == "tarantella") %>%
+    filter(Stream == Compute.Stream) %>%
+    filter(S >= 3.239) %>%
+    filter(E <= 3.261) %>%
+    group_by(Type) %>%
+    summarize(n=n(), duration=sum(Duration)) %>%
+    arrange(-duration) %>% select(Type) -> temp
+
+as.vector(temp$Type) -> legend.order
+
+# Plot for the NVProf operations in one batch
+df.nvprof.rank %>%
+    filter(Framework == "tarantella") %>%
+    filter(Stream == Compute.Stream) %>%
+    ggplot(aes(xmin = S, xmax=E, ymin = rank, ymax=rank+0.9, fill=Type)) + 
+    geom_rect(alpha=1) + my_theme() + 
+    scale_fill_brewer(name = "Operation Type", limits=legend.order, palette="Set1") +
+    guides(fill=guide_legend(nrow=1,byrow=TRUE, title.position="top", title.vjust = -1)) +
+    theme(legend.title = element_blank(),
+          plot.title = element_text(size = 20),
+          panel.grid.minor.y = element_blank(),                                                                                                  
+          panel.grid.major.y = element_blank()) + ggtitle("Zoom in on the batch marked in red above for NVProf") +
+    scale_y_continuous("GPUs", expand=c(0,0), lim=c(0,2), breaks=seq(0,1,1)) +
+    scale_x_continuous("Execution Time [s]", expand=c(0,0), 
+                       lim=c(0,13), breaks=seq(0,100,0.002)) + 
+    coord_cartesian(x=c(3.239,3.261)) -> p2
+
+plot_grid(p1, p2, ncol=1, rel_heights = c(3, 2))
+#+end_src
+
+#+RESULTS:
+[[file:./../img/nvprof-tnt-operations2.pdf]]
+
+** Process data - Horovod
+
+Setting new zero for Keras - horovod:
+#+begin_src R :results output :session *R* :exports both
+df.epoch %>%
+    filter(framework == "horovod") %>%
+    filter(rank == 0) %>%
+    mutate(Start = force_tz(start, tzone = "", roll = FALSE) - df.zero.11205$start.date) %>%
+    mutate(End = force_tz(end, tzone = "", roll = FALSE) - df.zero.11205$start.date) -> d1
+
+df.epoch %>%
+    filter(framework == "horovod") %>%
+    filter(rank == 1) %>%
+    mutate(Start = force_tz(start, tzone = "", roll = FALSE) - df.zero.55839$start.date) %>%
+    mutate(End = force_tz(end, tzone = "", roll = FALSE) - df.zero.55839$start.date) -> d2
+
+rbind(d1, d2) %>% print -> df.epoch.newzero
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 20 × 10
+# Groups:   framework, rank [2]
+   machine framework  rank start               end                 epoch       s
+   <chr>   <chr>     <dbl> <dttm>              <dttm>              <int>   <dbl>
+ 1 gemini  horovod       0 2021-11-08 04:14:51 2021-11-08 04:14:58     0  1.64e9
+ 2 gemini  horovod       0 2021-11-08 04:14:58 2021-11-08 04:14:59     1  1.64e9
+ 3 gemini  horovod       0 2021-11-08 04:14:59 2021-11-08 04:15:00     2  1.64e9
+ 4 gemini  horovod       0 2021-11-08 04:15:00 2021-11-08 04:15:00     3  1.64e9
+ 5 gemini  horovod       0 2021-11-08 04:15:01 2021-11-08 04:15:01     4  1.64e9
+ 6 gemini  horovod       0 2021-11-08 04:15:01 2021-11-08 04:15:02     5  1.64e9
+ 7 gemini  horovod       0 2021-11-08 04:15:02 2021-11-08 04:15:03     6  1.64e9
+ 8 gemini  horovod       0 2021-11-08 04:15:03 2021-11-08 04:15:04     7  1.64e9
+ 9 gemini  horovod       0 2021-11-08 04:15:04 2021-11-08 04:15:05     8  1.64e9
+10 gemini  horovod       0 2021-11-08 04:15:05 2021-11-08 04:15:06     9  1.64e9
+11 gemini  horovod       1 2021-11-08 04:14:51 2021-11-08 04:14:58     0  1.64e9
+12 gemini  horovod       1 2021-11-08 04:14:58 2021-11-08 04:14:59     1  1.64e9
+13 gemini  horovod       1 2021-11-08 04:14:59 2021-11-08 04:15:00     2  1.64e9
+14 gemini  horovod       1 2021-11-08 04:15:00 2021-11-08 04:15:01     3  1.64e9
+15 gemini  horovod       1 2021-11-08 04:15:01 2021-11-08 04:15:01     4  1.64e9
+16 gemini  horovod       1 2021-11-08 04:15:01 2021-11-08 04:15:02     5  1.64e9
+17 gemini  horovod       1 2021-11-08 04:15:02 2021-11-08 04:15:03     6  1.64e9
+18 gemini  horovod       1 2021-11-08 04:15:03 2021-11-08 04:15:04     7  1.64e9
+19 gemini  horovod       1 2021-11-08 04:15:04 2021-11-08 04:15:05     8  1.64e9
+20 gemini  horovod       1 2021-11-08 04:15:05 2021-11-08 04:15:06     9  1.64e9
+# … with 3 more variables: e <dbl>, Start <drtn>, End <drtn>
+#+end_example
+
+Group batch and NVProf output to the same plot
+#+begin_src R :results output :session *R* :exports both
+df.epoch.newzero %>%
+    filter(framework == "horovod") %>%
+    mutate(S = as.numeric(Start)) %>%
+    mutate(E = as.numeric(End)) %>%
+    select(rank, S, E) %>%
+    mutate(rank = rank + 0.5) %>%
+    mutate(Type = "Epoch") -> df.e
+
+df.nvprof.rank %>%
+    filter(Framework == "horovod") %>%
+    filter(Stream == 14) %>% # checking the data and NVProf we confirmed this thread does the computations
+    select(rank, S, E) %>%
+    mutate(Type = "NVProf") -> df.nvp
+
+rbind(df.e, df.nvp) -> df.epoch.nvvp.hvd
+#+end_src
+
+#+RESULTS:
+: 
+: Adding missing grouping variables: `framework`
+
+** [Plot] NVProf - Horovod
+#+begin_src R :results output file graphics :file ./../img/nvprof-hvd-operations2.pdf :exports both :width 12 :height 8 :session *R*
+df.epoch.nvvp.hvd %>%
+    ggplot(aes(xmin = S, xmax= E,
+               ymin = rank, ymax = rank + 0.5,
+               fill = as.factor(Type))) +
+    geom_rect() + my_theme() +  
+    scale_fill_manual(values=c("orange", "#76b900")) +
+    theme(legend.title=element_blank(), 
+          panel.grid.major.y = element_blank(), 
+          axis.text.x = element_text(angle = 30, vjust = 1, hjust=0.6),
+          panel.grid.minor.y = element_blank()) +
+    geom_vline(xintercept=c(6.676,6.723), color="red", size=0.8, alpha=1) +
+    scale_y_continuous("GPUs", expand=c(0,0), breaks=seq(0,1,1)) +
+    scale_x_continuous("Execution Time [s]", expand=c(0,0), breaks=seq(0,100,0.6)) +
+    facet_zoom(xlim = c(6, 7.3), zoom.size = 0.9) -> p1
+
+Compute.Stream <- 14 # We confirm this Stream performs computations using the NVProf and measures analysis
+# Get legend in order of appearance and only for the time interval:
+df.nvprof.rank %>%
+    filter(Framework == "horovod") %>%
+    filter(Stream == Compute.Stream) %>%
+    filter(S >= 6.676) %>%
+    filter(E <= 6.723) %>%
+    group_by(Type) %>%
+    summarize(n=n(), duration=sum(Duration)) %>%
+    arrange(-duration) %>% select(Type) -> temp
+
+as.vector(temp$Type) -> legend.order
+
+# Plot for the NVProf operations in one batch
+df.nvprof.rank %>%
+    filter(Framework == "horovod") %>%
+    filter(Stream == Compute.Stream) %>%
+    ggplot(aes(xmin = S, xmax=E, ymin = rank, ymax=rank+0.9, fill=Type)) + 
+    geom_rect(alpha=1) + my_theme() + 
+    scale_fill_brewer(name = "Operation Type", limits=legend.order, palette="Set1") +
+    guides(fill=guide_legend(nrow=1,byrow=TRUE, title.position="top", title.vjust = -1)) +
+    theme(legend.title = element_blank(),
+          plot.title = element_text(size = 20),
+          panel.grid.minor.y = element_blank(),                                                                                                  
+          panel.grid.major.y = element_blank()) + ggtitle("Zoom in on the batch marked in red above for NVProf") +
+    scale_y_continuous("GPUs", expand=c(0,0), lim=c(0,2), breaks=seq(0,1,1)) +
+    scale_x_continuous("Execution Time [s]", expand=c(0,0), 
+                       lim=c(0,13), breaks=seq(0,100,0.004)) + 
+    coord_cartesian(x=c(6.676,6.723)) -> p2
+
+plot_grid(p1, p2, ncol=1, rel_heights = c(3, 2))
+#+end_src
+
+#+RESULTS:
+[[file:./../img/nvprof-hvd-operations2.pdf]]
+
+** Temporal aggregation
+*** Tarantella
+**** [[Process data - Tarantella]]
+**** Rank 0
+#+begin_src R :results output :session *R* :exports both
+df.nvprof.rank %>% 
+    filter(Framework == "tarantella") %>%
+    filter(rank == 0) -> df.nvprof.rank0
+
+df.epoch.newzero %>%
+    filter(framework == "tarantella") %>%
+    mutate(s.epoch = as.numeric(Start)) %>%
+    mutate(e.epoch = as.numeric(End)) %>%
+    mutate(Type = "Epoch") %>%
+    select(-Start, -End) %>%
+    filter(rank == 0) -> epochs.tnt
+
+setDT(epochs.tnt)
+setDT(df.nvprof.rank0)
+
+df.nvprof.rank0[epochs.tnt,
+       on = .(S >= s.epoch, E <= e.epoch),
+       nomatch = NA,
+       allow.cartesian = FALSE,
+       .(Stream, Name, S, E, Type, s.epoch, e.epoch, Dur, rank, epoch)] %>%
+    as_tibble %>%
+    print -> df.saida.rank0
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 34,464 × 10
+   Stream Name               S     E Type    s.epoch e.epoch     Dur  rank epoch
+    <dbl> <chr>          <dbl> <dbl> <chr>     <dbl>   <dbl>   <dbl> <int> <int>
+ 1     14 void Eigen::i… 0.888  4.22 eigen     0.888    4.22 2.21e-6     0     0
+ 2     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 9.6 e-7     0     0
+ 3     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 7.04e-7     0     0
+ 4     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 7.04e-7     0     0
+ 5     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 9.92e-7     0     0
+ 6     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 7.04e-7     0     0
+ 7     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 7.36e-7     0     0
+ 8     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 7.04e-7     0     0
+ 9     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 5.90e-4     0     0
+10     15 [CUDA memcpy … 0.888  4.22 [CUDA …   0.888    4.22 1.15e-6     0     0
+# … with 34,454 more rows
+#+end_example
+
+Checking distinct CUDA memcpy operations
+#+begin_src R :results output :session *R* :exports both
+df.saida.rank0 %>% filter(grepl("CUDA", Name)) %>% distinct(Name)
+#+end_src
+
+#+RESULTS:
+: # A tibble: 4 × 1
+:   Name              
+:   <chr>             
+: 1 [CUDA memcpy HtoD]
+: 2 [CUDA memset]     
+: 3 [CUDA memcpy DtoH]
+: 4 [CUDA memcpy DtoD]
+
+**** Rank 1
+#+begin_src R :results output :session *R* :exports both
+df.nvprof.rank %>% 
+    filter(Framework == "tarantella") %>%
+    filter(rank==1) -> df.nvprof.rank1
+
+df.epoch.newzero %>%
+    filter(framework == "tarantella") %>%
+    mutate(s.epoch = as.numeric(Start)) %>%
+    mutate(e.epoch = as.numeric(End)) %>%
+    mutate(Type = "Epoch") %>%
+    select(-Start, -End) %>%
+    filter(rank == 1) -> epochs.tnt
+
+setDT(epochs.tnt)
+setDT(df.nvprof.rank1)
+
+df.nvprof.rank1[epochs.tnt,
+       on = .(S >= s.epoch, E <= e.epoch),
+       nomatch = NA,
+       allow.cartesian = FALSE,
+       .(Stream, Name, S, E, Type, s.epoch, e.epoch, Dur, rank, epoch)] %>%
+    as_tibble %>%
+    print -> df.saida.rank1
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 35,926 × 10
+   Stream Name               S     E Type    s.epoch e.epoch     Dur  rank epoch
+    <dbl> <chr>          <dbl> <dbl> <chr>     <dbl>   <dbl>   <dbl> <int> <int>
+ 1     14 void Eigen::i… 0.814  4.19 eigen     0.814    4.19 2.34e-6     1     0
+ 2     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 8.32e-7     1     0
+ 3     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 7.04e-7     1     0
+ 4     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 7.36e-7     1     0
+ 5     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 9.92e-7     1     0
+ 6     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 7.04e-7     1     0
+ 7     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 7.36e-7     1     0
+ 8     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 7.04e-7     1     0
+ 9     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 5.78e-4     1     0
+10     15 [CUDA memcpy … 0.814  4.19 [CUDA …   0.814    4.19 1.15e-6     1     0
+# … with 35,916 more rows
+#+end_example
+
+**** Check total execution time per epoch for all streams
+
+#+begin_src R :results output :session *R* :exports both
+rbind(df.saida.rank0, df.saida.rank1) %>% 
+    mutate(optype = case_when(grepl("CUDA", Type) ~ "Communication",
+                              TRUE ~ "GPU")) %>%
+    group_by(epoch,rank,optype) %>%
+    summarize(
+        N = n(),
+        Streams = unique(Stream) %>% length,
+        S = max(s.epoch), E = max(e.epoch), 
+        `Epoch Duration` = as.numeric(max(e.epoch) - min(s.epoch)),
+        `Time in GPU` = sum(Dur),
+        .groups="drop") %>% 
+    arrange(rank,epoch) %>% 
+    select(-S, -E) %>% 
+    mutate(Framework = "Tarantella") %>% print -> compute.time.tnt
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 40 × 8
+   epoch  rank optype         N Streams `Epoch Duration` `Time in GPU` Framework
+   <int> <int> <chr>      <int>   <int>            <dbl>         <dbl> <chr>    
+ 1     0     0 Communica…   829       7            3.33         0.0570 Tarantel…
+ 2     0     0 GPU         2776       2            3.33         0.486  Tarantel…
+ 3     1     0 Communica…   684       3            0.854        0.0561 Tarantel…
+ 4     1     0 GPU         2670       1            0.854        0.399  Tarantel…
+ 5     2     0 Communica…   692       3            0.860        0.0564 Tarantel…
+ 6     2     0 GPU         2708       1            0.860        0.400  Tarantel…
+ 7     3     0 Communica…   692       3            0.808        0.0567 Tarantel…
+ 8     3     0 GPU         2714       1            0.808        0.401  Tarantel…
+ 9     4     0 Communica…   696       3            0.871        0.0577 Tarantel…
+10     4     0 GPU         2752       1            0.871        0.404  Tarantel…
+# … with 30 more rows
+#+end_example
+
+*** Horovod
+**** [[Process data - Horovod]]
+**** Rank 0
+#+begin_src R :results output :session *R* :exports both
+df.nvprof.rank %>% 
+    filter(Framework == "horovod") %>%
+    filter(rank == 0) -> df.nvprof.rank0
+
+df.epoch.newzero %>%
+    filter(framework == "horovod") %>%
+    mutate(s.epoch = as.numeric(Start)) %>%
+    mutate(e.epoch = as.numeric(End)) %>%
+    mutate(Type = "Epoch") %>%
+    select(-Start, -End) %>%
+    filter(rank == 0) -> epochs.hvd
+
+setDT(epochs.hvd)
+setDT(df.nvprof.rank0)
+
+df.nvprof.rank0[epochs.hvd,
+       on = .(S >= s.epoch, E <= e.epoch),
+       nomatch = NA,
+       allow.cartesian = FALSE,
+       .(Stream, Name, S, E, Type, s.epoch, e.epoch, Dur, rank, epoch)] %>%
+    as_tibble %>%
+    print -> df.saida.rank0
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 14,291 × 10
+   Stream Name               S     E Type    s.epoch e.epoch     Dur  rank epoch
+    <dbl> <chr>          <dbl> <dbl> <chr>     <dbl>   <dbl>   <dbl> <int> <int>
+ 1     14 void Eigen::i… 0.618  7.70 eigen     0.618    7.70 2.21e-6     0     0
+ 2     15 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 7.36e-7     0     0
+ 3     15 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 7.36e-7     0     0
+ 4     15 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 9.6 e-7     0     0
+ 5     15 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 7.69e-7     0     0
+ 6     15 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 7.68e-7     0     0
+ 7     15 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 7.36e-7     0     0
+ 8     15 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 1.15e-3     0     0
+ 9     16 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 4.26e-6     0     0
+10     15 [CUDA memcpy … 0.618  7.70 [CUDA …   0.618    7.70 1.6 e-6     0     0
+# … with 14,281 more rows
+#+end_example
+
+**** Rank 1
+#+begin_src R :results output :session *R* :exports both
+df.nvprof.rank %>% 
+    filter(Framework == "horovod") %>%
+    filter(rank == 1) -> df.nvprof.rank1
+
+df.epoch.newzero %>%
+    filter(framework == "horovod") %>%
+    mutate(s.epoch = as.numeric(Start)) %>%
+    mutate(e.epoch = as.numeric(End)) %>%
+    mutate(Type = "Epoch") %>%
+    select(-Start, -End) %>%
+    filter(rank == 1) -> epochs.hvd
+
+setDT(epochs.hvd)
+setDT(df.nvprof.rank1)
+
+df.nvprof.rank1[epochs.hvd,
+       on = .(S >= s.epoch, E <= e.epoch),
+       nomatch = NA,
+       allow.cartesian = FALSE,
+       .(Stream, Name, S, E, Type, s.epoch, e.epoch, Dur, rank, epoch)] %>%
+    as_tibble %>%
+    print -> df.saida.rank1
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 14,291 × 10
+   Stream Name               S     E Type    s.epoch e.epoch     Dur  rank epoch
+    <dbl> <chr>          <dbl> <dbl> <chr>     <dbl>   <dbl>   <dbl> <int> <int>
+ 1     14 void Eigen::i… 0.724  7.50 eigen     0.724    7.50 2.53e-6     1     0
+ 2     15 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 7.04e-7     1     0
+ 3     15 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 7.36e-7     1     0
+ 4     15 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 9.92e-7     1     0
+ 5     15 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 7.05e-7     1     0
+ 6     15 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 7.69e-7     1     0
+ 7     15 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 7.04e-7     1     0
+ 8     15 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 1.15e-3     1     0
+ 9     16 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 4.90e-6     1     0
+10     15 [CUDA memcpy … 0.724  7.50 [CUDA …   0.724    7.50 1.6 e-6     1     0
+# … with 14,281 more rows
+#+end_example
+
+**** Check total execution time per epoch for all streams
+#+begin_src R :results output :session *R* :exports both
+rbind(df.saida.rank0, df.saida.rank1) %>% 
+    mutate(optype = case_when(grepl("CUDA", Type) ~ "Communication",
+                              TRUE ~ "GPU")) %>%
+    group_by(epoch,rank,optype) %>%
+    summarize(
+        N = n(),
+        Streams = unique(Stream) %>% length,
+        S = max(s.epoch), E = max(e.epoch), 
+        `Epoch Duration` = as.numeric(max(e.epoch) - min(s.epoch)),
+        `Time in GPU` = sum(Dur),
+        .groups="drop") %>% 
+    arrange(rank,epoch) %>% 
+    select(-S, -E) %>% 
+    mutate(Framework = "Horovod") %>% print -> compute.time.hvd
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+# A tibble: 40 × 8
+   epoch  rank optype         N Streams `Epoch Duration` `Time in GPU` Framework
+   <int> <int> <chr>      <int>   <int>            <dbl>         <dbl> <chr>    
+ 1     0     0 Communica…   410      15            7.09         0.0195 Horovod  
+ 2     0     0 GPU         1473       3            7.09         0.913  Horovod  
+ 3     1     0 Communica…   152       3            0.768        0.0155 Horovod  
+ 4     1     0 GPU         1226       2            0.768        0.663  Horovod  
+ 5     2     0 Communica…   152       3            0.889        0.0157 Horovod  
+ 6     2     0 GPU         1222       2            0.889        0.643  Horovod  
+ 7     3     0 Communica…   152       3            0.827        0.0155 Horovod  
+ 8     3     0 GPU         1229       2            0.827        0.680  Horovod  
+ 9     4     0 Communica…   152       3            0.716        0.0155 Horovod  
+10     4     0 GPU         1226       2            0.716        0.648  Horovod  
+# … with 30 more rows
+#+end_example
+
+** [Plot] Temporal aggregation
+*** Seconds
+
+#+begin_src R :results output :session *R* :exports both
+rbind(compute.time.tnt, compute.time.hvd) %>%
+    select(epoch, rank, Framework, `Time in GPU`, optype)  %>%
+    rename(T = `Time in GPU`) -> t1
+
+rbind(compute.time.tnt, compute.time.hvd) %>% 
+    select(-Streams, -N) %>%
+    group_by(epoch, rank, Framework) %>%
+    summarize(T = max(`Epoch Duration`) - sum(`Time in GPU`)) %>%
+    mutate(optype="CPU") -> t2
+
+rbind(t1,t2) %>%
+    mutate(Time = round(T, 2)) -> df.all
+#+end_src
+
+#+RESULTS:
+: 
+: `summarise()` has grouped output by 'epoch', 'rank'. You can override using the `.groups` argument.
+
+Data about the first epoch:
+#+begin_src R :results output :session *R* :exports both
+df.all %>% filter(epoch==0) %>% arrange(-Time)
+#+end_src
+
+#+RESULTS:
+#+begin_example
+# A tibble: 12 × 6
+   epoch  rank Framework       T optype         Time
+   <int> <int> <chr>       <dbl> <chr>         <dbl>
+ 1     0     0 Horovod    6.15   CPU            6.15
+ 2     0     1 Horovod    5.80   CPU            5.8 
+ 3     0     0 Tarantella 2.79   CPU            2.79
+ 4     0     1 Tarantella 2.79   CPU            2.79
+ 5     0     1 Horovod    0.957  GPU            0.96
+ 6     0     0 Horovod    0.913  GPU            0.91
+ 7     0     1 Tarantella 0.524  GPU            0.52
+ 8     0     0 Tarantella 0.486  GPU            0.49
+ 9     0     0 Tarantella 0.0570 Communication  0.06
+10     0     1 Tarantella 0.0586 Communication  0.06
+11     0     0 Horovod    0.0195 Communication  0.02
+12     0     1 Horovod    0.0190 Communication  0.02
+#+end_example
+
+--
+
+#+RESULTS:
+#+begin_example
+# A tibble: 12 × 6
+   epoch  rank Framework       T optype         Time
+   <int> <int> <chr>       <dbl> <chr>         <dbl>
+ 1     0     0 Horovod    6.15   CPU            6.15
+ 2     0     1 Horovod    5.80   CPU            5.8 
+ 3     0     0 Tarantella 2.79   CPU            2.79
+ 4     0     1 Tarantella 2.79   CPU            2.79
+ 5     0     1 Horovod    0.957  GPU            0.96
+ 6     0     0 Horovod    0.913  GPU            0.91
+ 7     0     1 Tarantella 0.524  GPU            0.52
+ 8     0     0 Tarantella 0.486  GPU            0.49
+ 9     0     0 Tarantella 0.0570 Communication  0.06
+10     0     1 Tarantella 0.0586 Communication  0.06
+11     0     0 Horovod    0.0195 Communication  0.02
+12     0     1 Horovod    0.0190 Communication  0.02
+#+end_example
+
+#+begin_src R :results output file graphics :file ./../img/computetime-perepoch-sec1.pdf :exports both :width 14 :height 7 :session *R*
+# Get the values to plot text
+df.all %>% filter(epoch > 0) -> df.all.epochs
+
+df.all.epochs %>% filter(optype == "GPU") -> df.all.gpu
+ggplot() + 
+    geom_bar(data = filter(df.all.epochs, rank==0),
+             mapping = aes(x = epoch - 0.22, y = Time, fill = as.factor(optype)), 
+             stat="identity", position='stack', width = 0.42) + 
+    geom_text(data = filter(df.all.gpu, rank==0), 
+              aes(x = epoch - 0.22, y = 0.2, label = Time), size=5) + 
+    geom_bar(data = filter(df.all.epochs, rank==1),
+             mapping = aes(x = epoch + 0.22, y = Time, fill = as.factor(optype)), 
+             stat="identity", position='stack', width = 0.42) + 
+    geom_text(data = filter(df.all.gpu, rank==1), 
+              aes(x = epoch + 0.22, y = 0.22, label = Time), size=5) +
+    scale_y_continuous("Time [s]", expand=c(0,0), lim=c(0,1), breaks=seq(0,100,0.2)) + 
+    scale_x_continuous("Epoch", lim=c(0.5,9.5), expand=c(0,0), breaks=seq(0,9,1)) + 
+    facet_wrap(~Framework, ncol=1) +
+    scale_fill_brewer(palette="Set1") +
+    my_theme() + theme(legend.title = element_blank())
+#+end_src
+
+#+RESULTS:
+[[file:./../img/computetime-perepoch-sec1.pdf]]
